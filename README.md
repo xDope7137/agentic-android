@@ -308,3 +308,7 @@ taps land correctly even when screenshots are downscaled.
 - A confirmation gate for destructive actions (uninstall, factory reset, purchases).
 - `scroll_to_text` / `tap_text` helpers built on `dump_ui` for steadier targeting.
 - Multi-device fan-out; record and replay of a successful action trace.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Bhavik Patel.
