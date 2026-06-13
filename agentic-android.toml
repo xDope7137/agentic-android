@@ -1,0 +1,111 @@
+####################################################################
+#  Agentic Android — settings.  Edit this file, then run:
+#     python -m agentic_android
+#
+#  QUICK START
+#  1) Set `provider` below to the brain you want.
+#  2) Fill in that provider's section (api_key / model / base_url).
+#  3) Set [device].serial to your phone/emulator (see: --list-devices).
+#  4) Run `python -m agentic_android`.
+####################################################################
+
+
+# Which brain drives the phone?
+#   "claude-cli" → use your logged-in `claude` CLI. NO API key needed. (live chat)
+#   "anthropic"  → Anthropic API.            Needs [anthropic] api_key.
+#   "openai"     → OpenAI API or ANY OpenAI-compatible server (local, OpenRouter,
+#                  Azure, Groq, …).          Needs [openai] api_key + base_url.
+provider = "claude-cli"
+
+
+[device]
+# Your device's adb id. Run `python -m agentic_android --list-devices` to find it.
+# A networked emulator looks like "192.168.1.79:5555".
+serial = "192.168.1.79:5555"
+
+
+[agent]
+# HOW HARD the agent tries to fix things itself before stopping to ASK YOU a
+# question (with options).  0 = ask early, 5 = try everything first.
+#   0  ask at the first problem            (cheapest)
+#   3  several recovery attempts (default)
+#   5  exhaust every avenue; only ask for passwords / 2FA / purchases (priciest)
+# COST: higher = more screenshots + model calls before it pauses = more $$$.
+effort = 3
+# Screenshots are downscaled so their long edge is at most this many pixels
+# (smaller = cheaper/faster, less detail). 1568 is a good default.
+max_long_edge = 1568
+# Save every API request + response for a session to a file under debug/
+# (one JSONL file per run). Handy for debugging; off by default. Same as --debug.
+debug = true
+
+
+# ---- provider = "claude-cli" (recommended; no API key) -------------------
+[claude_cli]
+model = "sonnet"      # sonnet | haiku | opus
+budget_usd = 0        # 0 = no spend cap
+
+
+# ---- provider = "anthropic" ---------------------------------------------
+[anthropic]
+api_key = ""                       # or leave blank and set env ANTHROPIC_API_KEY
+model   = "claude-opus-4-8"
+vision  = false                    # images off for now (cheaper); see below
+
+
+# ---- provider = "openai" (and OpenAI-compatible servers) ----------------
+[openai]
+api_key  = ""                            # or leave blank and set env OPENAI_API_KEY
+# Change this to point at any OpenAI-compatible endpoint:
+#   OpenAI            https://api.openai.com/v1
+#   OpenRouter        https://openrouter.ai/api/v1
+#   Local (Ollama)    http://localhost:11434/v1
+#   LM Studio         http://localhost:1234/v1
+base_url = "https://api.openai.com/v1"
+model    = "gpt-4o-mini"
+
+# Can your model SEE images?
+#   true  → it gets screenshots (use a vision model like gpt-4o). Best results.
+#   false → it CANNOT see images, so the agent describes the screen as a TEXT
+#           list of on-screen buttons/fields with tap coordinates (built from the
+#           Android UI tree). Use this for text-only models (most local LLMs).
+#
+# COST NOTE (measured on gpt-4o-mini): ONE screenshot ≈ 37,800 input tokens,
+# while the text element list ≈ 2,200 — vision is ~17x pricier per screen and
+# it compounds (every step resends past screenshots). Keep this false to save $$.
+vision = true
+
+
+# ---- provider = "ollama" (local model; free, runs on your machine) ------
+# A local OpenAI-compatible server. Set provider = "ollama" above to use it.
+# Needs no API key. The model must support tool/function calling (e.g. qwen3,
+# llama3.1/3.2, mistral-nemo). Vision models (qwen3-vl, llava) can set vision=true.
+[ollama]
+base_url = "http://localhost:11434/v1"   # Ollama default
+model    = ""                            # blank = auto-detect the loaded model
+vision   = false                         # qwen3-vl etc. can do true (free locally)
+# Context window. Ollama defaults to only 4096, which is too small for an agent.
+# Set high since local tokens are free; lower it ONLY if you hit GPU/RAM limits
+# (bigger context = more memory). Output length is uncapped for local models.
+num_ctx  = 32768
+
+
+# ---- provider = "lmstudio" (local model via LM Studio; free) ------------
+# Start the server in LM Studio's "Developer" tab and load a model that supports
+# tool calling (e.g. Gemma 4, Qwen, Llama 3.x). Set a generous context length
+# when you load the model (LM Studio default is small) so long tasks don't get
+# truncated. Set provider = "lmstudio" above to use it.
+[lmstudio]
+base_url = "http://localhost:1234/v1"    # LM Studio default
+model    = ""                            # blank = auto-detect (skips embedding models)
+vision   = false                         # multimodal models (Gemma 4, etc.) can do true
+
+
+# ---- Pricing (USD per 1 MILLION tokens) ---------------------------------
+# Used to print a cost estimate after each run. Common models are built in;
+# add/override here (e.g. for a custom or local endpoint). cached_input is the
+# discounted rate for prompt-cache hits.
+[pricing]
+"gpt-4o-mini" = { input = 0.15, output = 0.60, cached_input = 0.075 }
+"gpt-4o"      = { input = 2.50, output = 10.0, cached_input = 1.25 }
+# "my-local-model" = { input = 0.0, output = 0.0 }

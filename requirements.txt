@@ -1,0 +1,12 @@
+# Core — device control + the claude-cli chat (brain = your `claude` CLI)
+adbutils>=2.0            # ships a bundled adb binary, so no system adb is needed
+mcp>=1.0                 # MCP server that exposes device tools to the claude agent
+defusedxml>=0.7          # safe parse of the UI tree (text mode for non-vision models)
+
+# Brains for the API providers (install the one(s) you use)
+anthropic>=0.69          # provider = "anthropic"
+openai>=1.40             # provider = "openai" (and OpenAI-compatible endpoints)
+
+# Optional
+Pillow>=10.0 ; python_version < "3.14"   # downscale large screenshots (full-res fallback without it)
+python-dotenv>=1.0       # load a local .env
