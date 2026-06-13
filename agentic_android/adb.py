@@ -12,10 +12,20 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 
 class ADBError(RuntimeError):
     """Raised when an adb invocation exits non-zero."""
+
+
+# Error fragments that usually mean "try again" (a flaky/dropped connection)
+# rather than a real failure like "no such element". Retried with backoff.
+_TRANSIENT = (
+    "device offline", "device not found", "no devices", "device still authorizing",
+    "device unauthorized", "closed", "protocol fault", "connection reset",
+    "connection refused", "timed out", "timeout", "error: device",
+)
 
 
 # Characters that `input text` / the shell would otherwise interpret.
@@ -47,9 +57,13 @@ def resolve_adb_path() -> str:
 
 
 class ADB:
-    def __init__(self, serial: str | None = None, adb_path: str | None = None):
+    def __init__(self, serial: str | None = None, adb_path: str | None = None,
+                 retries: int = 2, backoff: float = 0.5, timeout: int = 60):
         self.serial = serial or os.environ.get("ANDROID_SERIAL")
         self.adb_path = adb_path or resolve_adb_path()
+        self.retries = retries
+        self.backoff = backoff
+        self.timeout = timeout
 
     def ensure_connected(self) -> None:
         """For a network serial (host:port), make sure adb has connected to it."""
@@ -67,21 +81,51 @@ class ADB:
             cmd += ["-s", self.serial]
         return cmd
 
-    def run(self, *args: str, binary: bool = False, timeout: int = 60):
-        """Run `adb <args>` and return stdout (str, or bytes if binary)."""
-        try:
-            proc = subprocess.run(
-                self._base() + list(args), capture_output=True, timeout=timeout
-            )
-        except FileNotFoundError as exc:
-            raise ADBError(
-                f"`{self.adb_path}` not found. Install Android platform-tools "
-                "and ensure adb is on PATH."
-            ) from exc
-        if proc.returncode != 0:
-            msg = proc.stderr.decode("utf-8", "replace").strip()
-            raise ADBError(msg or f"adb {' '.join(args)} failed (exit {proc.returncode})")
-        return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
+    def run(self, *args: str, binary: bool = False, timeout: int | None = None,
+            retries: int | None = None, backoff: float | None = None):
+        """Run `adb <args>` and return stdout (str, or bytes if binary).
+
+        Transient failures (a dropped/flaky connection, a timeout) are retried
+        with exponential backoff, reconnecting first for network serials. A real
+        error (non-zero exit that isn't transient) fails fast. A timeout is
+        surfaced as an ADBError so callers' `except ADBError` handles it."""
+        timeout = self.timeout if timeout is None else timeout
+        retries = self.retries if retries is None else retries
+        backoff = self.backoff if backoff is None else backoff
+        last: ADBError | None = None
+        for attempt in range(retries + 1):
+            try:
+                proc = subprocess.run(
+                    self._base() + list(args), capture_output=True, timeout=timeout
+                )
+            except FileNotFoundError as exc:
+                raise ADBError(
+                    f"`{self.adb_path}` not found. Install Android platform-tools "
+                    "and ensure adb is on PATH."
+                ) from exc
+            except subprocess.TimeoutExpired:
+                last = ADBError(f"adb {' '.join(args)} timed out after {timeout}s")
+            else:
+                if proc.returncode == 0:
+                    return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
+                msg = proc.stderr.decode("utf-8", "replace").strip()
+                last = ADBError(msg or f"adb {' '.join(args)} failed (exit {proc.returncode})")
+                if not any(t in msg.lower() for t in _TRANSIENT):
+                    raise last  # a real error — don't waste retries on it
+            if attempt < retries:
+                self._reconnect()
+                time.sleep(backoff * (2 ** attempt))
+        raise last or ADBError(f"adb {' '.join(args)} failed")
+
+    def _reconnect(self) -> None:
+        """Best-effort re-establish a dropped network (host:port) connection.
+        Runs a bare `adb connect` directly (no -s, no retry) to avoid recursion."""
+        if self.serial and ":" in self.serial:
+            try:
+                subprocess.run([self.adb_path, "connect", self.serial],
+                               capture_output=True, timeout=self.timeout)
+            except Exception:
+                pass
 
     def shell(self, command: str, binary: bool = False, timeout: int = 60):
         """Run a command inside `adb shell`."""

@@ -18,11 +18,22 @@ import os
 from mcp.server.fastmcp import FastMCP, Image
 
 from .adb import ADB, ADBError
-from .device import Device
+from .device import DEFAULT_DESTRUCTIVE, Device, is_destructive
 
 mcp = FastMCP("agentic_android")
 
 _device: Device | None = None
+
+
+def _envb(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "", "false", "no")
+
+
+def _confirm_on() -> bool:
+    return _envb("AGENTIC_ANDROID_CONFIRM_DESTRUCTIVE", False)
 
 
 def _dev() -> Device:
@@ -31,18 +42,49 @@ def _dev() -> Device:
         adb = ADB(
             serial=os.environ.get("ANDROID_SERIAL") or None,
             adb_path=os.environ.get("AGENTIC_ANDROID_ADB") or None,
+            retries=int(os.environ.get("AGENTIC_ANDROID_ADB_RETRIES", "2")),
         )
         adb.ensure_connected()  # connect network serials (host:port)
+        kw = os.environ.get("AGENTIC_ANDROID_DESTRUCTIVE_KEYWORDS")
         _device = Device(
             adb=adb,
             max_long_edge=int(os.environ.get("AGENTIC_ANDROID_MAX_LONG_EDGE", "1568")),
+            blank_png_bytes=int(os.environ.get("AGENTIC_ANDROID_BLANK_PNG_BYTES", "20000")),
+            auto_ui_fallback=_envb("AGENTIC_ANDROID_AUTO_UI_FALLBACK", True),
+            wait_idle=_envb("AGENTIC_ANDROID_WAIT_IDLE", True),
+            settle_timeout=float(os.environ.get("AGENTIC_ANDROID_SETTLE_TIMEOUT", "4.0")),
+            destructive_keywords=[k for k in kw.split(",") if k] if kw else DEFAULT_DESTRUCTIVE,
         )
     return _device
 
 
-def _shot() -> Image:
-    shot = _dev().screenshot()
-    return Image(data=base64.b64decode(shot["data"]), format="png")
+def _shot():
+    """Return the current screen for a tool result. Normally an Image; if the
+    capture comes back blank/black (a protected/unrendered surface), return the
+    UI element list as text instead so the agent isn't stranded on a dead image."""
+    dev = _dev()
+    o = dev.observe(vision=True)
+    if o["blank"] and dev.auto_ui_fallback:
+        return o["text"]
+    return Image(data=base64.b64decode(o["image"]), format="png")
+
+
+def _gate_coords(dev: Device, x: int, y: int) -> str | None:
+    """Best-effort 'BLOCKED' message if a raw tap lands on a known destructive
+    element. No-op when nothing relevant is nearby."""
+    els = dev._last_elements
+    if not els:
+        return None
+    dx, dy = dev._to_device(x, y)
+    near = min(els, key=lambda e: (e["cx"] - dx) ** 2 + (e["cy"] - dy) ** 2)
+    if (near["cx"] - dx) ** 2 + (near["cy"] - dy) ** 2 > 75 * 75:
+        return None
+    kw = is_destructive(near.get("label"), dev.destructive_keywords)
+    if kw:
+        label = near.get("label") or ""
+        return (f"BLOCKED: tapping near '{label}' looks destructive (matched '{kw}'). "
+                "Ask the user to confirm in chat, then retry tap with confirm=true.")
+    return None
 
 
 @mcp.tool()
@@ -53,21 +95,41 @@ def screenshot() -> Image:
 
 
 @mcp.tool()
-def tap(x: int, y: int):
-    """Tap at (x, y) in screenshot pixels. Returns the resulting screen."""
+def tap(x: int, y: int, confirm: bool = False):
+    """Tap at (x, y) in screenshot pixels. Returns the resulting screen. If the
+    destructive-action gate is on and the tap lands on a risky control, it is
+    blocked until you pass confirm=true (after the user agrees)."""
+    dev = _dev()
+    if _confirm_on() and not confirm:
+        blocked = _gate_coords(dev, x, y)
+        if blocked:
+            return blocked
     try:
-        _dev().tap(x, y)
+        dev.tap(x, y)
     except ADBError as e:
         return f"tap failed: {e}"
     return _shot()
 
 
 @mcp.tool()
-def tap_element(index: int | None = None, text: str = ""):
+def tap_element(index: int | None = None, text: str = "", confirm: bool = False):
     """Preferred tap: tap an element from the dump_ui/element list by its #index
-    or by its text/label (case-insensitive). More reliable than raw coordinates."""
+    or by its text/label (case-insensitive). More reliable than raw coordinates.
+    If the destructive-action gate is on and the target is risky (uninstall, buy,
+    delete, …), it is blocked until you pass confirm=true (after the user agrees)."""
+    dev = _dev()
     try:
-        _dev().tap_element(index=index, text=text or None)
+        target = dev.resolve_element(index=index, text=text or None)
+    except ADBError as e:
+        return f"tap_element failed: {e}"
+    if _confirm_on() and not confirm:
+        kw = is_destructive(target.get("label") or target.get("id"), dev.destructive_keywords)
+        if kw:
+            label = target.get("label") or target.get("id") or ""
+            return (f"BLOCKED: tapping '{label}' is a destructive action (matched '{kw}'). "
+                    "Ask the user to confirm in chat, then retry tap_element with confirm=true.")
+    try:
+        dev.tap_element(index=index, text=text or None)
     except ADBError as e:
         return f"tap_element failed: {e}"
     return _shot()

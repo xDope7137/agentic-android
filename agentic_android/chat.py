@@ -61,18 +61,42 @@ ask first. The user may send new messages while you work — treat them as \
 steering and adjust immediately.\
 """
 
+# Added to the system prompt only when confirm_destructive is on.
+_CONFIRM_PROTOCOL = (
+    "Destructive-action guard: before any irreversible or committing action "
+    "(uninstalling, deleting, buying/paying, placing an order, factory reset, or "
+    "signing out), STOP and ask the user in one short message that states the exact "
+    "action and target, and wait for an explicit 'yes' before doing it. The device "
+    "tools also block these and return a 'BLOCKED' message until you confirm; when "
+    "that happens, ask the user, then retry the same tool with confirm=true."
+)
 
-def _mcp_config(serial: str, adb_path: str, max_long_edge: int) -> str:
+
+def _mcp_config(serial: str, adb_path: str, max_long_edge: int, *,
+                blank_png_bytes: int = 20000, auto_ui_fallback: bool = True,
+                wait_idle: bool = True, settle_timeout: float = 4.0,
+                adb_retries: int = 2, confirm_destructive: bool = False,
+                destructive_keywords: list | None = None) -> str:
+    env = {
+        "ANDROID_SERIAL": serial or "",
+        "AGENTIC_ANDROID_ADB": adb_path,
+        "AGENTIC_ANDROID_MAX_LONG_EDGE": str(max_long_edge),
+        # "Reliable Runs" knobs (mcp_server._dev reads these)
+        "AGENTIC_ANDROID_BLANK_PNG_BYTES": str(blank_png_bytes),
+        "AGENTIC_ANDROID_AUTO_UI_FALLBACK": "1" if auto_ui_fallback else "0",
+        "AGENTIC_ANDROID_WAIT_IDLE": "1" if wait_idle else "0",
+        "AGENTIC_ANDROID_SETTLE_TIMEOUT": str(settle_timeout),
+        "AGENTIC_ANDROID_ADB_RETRIES": str(adb_retries),
+        "AGENTIC_ANDROID_CONFIRM_DESTRUCTIVE": "1" if confirm_destructive else "0",
+    }
+    if destructive_keywords:
+        env["AGENTIC_ANDROID_DESTRUCTIVE_KEYWORDS"] = ",".join(destructive_keywords)
     cfg = {
         "mcpServers": {
             "agentic_android": {
                 "command": sys.executable,
                 "args": ["-m", "agentic_android.mcp_server"],
-                "env": {
-                    "ANDROID_SERIAL": serial or "",
-                    "AGENTIC_ANDROID_ADB": adb_path,
-                    "AGENTIC_ANDROID_MAX_LONG_EDGE": str(max_long_edge),
-                },
+                "env": env,
             }
         }
     }
@@ -129,7 +153,10 @@ def _stderr(proc: subprocess.Popen) -> None:
 
 def run_chat(serial: str, adb_path: str, model: str = "sonnet",
              budget: float | None = None, max_long_edge: int = 1568,
-             effort: int = 3, debug_path: str | None = None) -> int:
+             effort: int = 3, debug_path: str | None = None, *,
+             blank_png_bytes: int = 20000, auto_ui_fallback: bool = True,
+             wait_idle: bool = True, settle_timeout: float = 4.0, adb_retries: int = 2,
+             confirm_destructive: bool = False, destructive_keywords: list | None = None) -> int:
     try:  # flush each line as it's printed (so piped/redirected output stays live)
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -141,8 +168,14 @@ def run_chat(serial: str, adb_path: str, model: str = "sonnet",
         return 2
 
     system_prompt = APPEND_SYSTEM_PROMPT + "\n\nPersistence & asking:\n" + persistence_block(effort, "chat")
+    if confirm_destructive:
+        system_prompt += "\n\n" + _CONFIRM_PROTOCOL
 
-    mcp_cfg = _mcp_config(serial, adb_path, max_long_edge)
+    mcp_cfg = _mcp_config(serial, adb_path, max_long_edge,
+                          blank_png_bytes=blank_png_bytes, auto_ui_fallback=auto_ui_fallback,
+                          wait_idle=wait_idle, settle_timeout=settle_timeout,
+                          adb_retries=adb_retries, confirm_destructive=confirm_destructive,
+                          destructive_keywords=destructive_keywords)
     args = [
         claude, "-p",
         "--input-format", "stream-json",

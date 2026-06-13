@@ -139,6 +139,43 @@ Run with no arguments and it uses the config:
 python -m agentic_android
 ```
 
+## Reliability and diagnostics
+
+A few things keep runs working outside a demo. They're on by default and tunable
+in `[agent]`:
+
+- Blank-screen fallback. Some app surfaces can't be screen-captured and come back
+  black. The agent detects this (a dead capture is a tiny PNG) and reads the screen
+  from the UI element list instead, so it keeps going rather than stalling.
+- Wait-for-idle. After each action it waits for the screen to stop changing (up to
+  `settle_timeout`) instead of a fixed delay, so it doesn't act on a half-loaded screen.
+- Retries and timeouts. Transient `adb` failures (a dropped network device) are
+  retried with backoff and a reconnect; LLM calls have a timeout so a stalled
+  connection can't hang the run.
+- Confirmation gate (opt-in). Set `confirm_destructive = true` (or pass
+  `--confirm-destructive`) and the agent stops for a `y/N` before high-risk actions:
+  uninstall, buy/pay, delete, factory reset, sign out.
+
+Run a preflight check anytime:
+
+```bash
+python -m agentic_android --doctor
+```
+```
+Agentic Android — preflight doctor
+  provider=ollama · device=192.168.1.79:5555
+
+  [PASS] adb            bundled adbutils binary
+  [PASS] device         192.168.1.79:5555 connected
+  [PASS] screenshot     1080x2400 PNG, non-blank
+  [FAIL] ollama server  no response from http://localhost:11434/v1
+           → Start `ollama serve`.
+```
+
+The same checks run automatically before each task (skip with `--no-preflight`), so
+setup problems show up as a clear message instead of a cryptic error. If exactly one
+device is attached it's selected automatically, so `--serial` is optional.
+
 ## Usage
 
 ### Live chat through the `claude` CLI (no API key)
@@ -169,12 +206,52 @@ to `claude --max-budget-usd`). The agent runs with its working directory set to
 this project, so its Claude Code session history stays separate from other
 projects.
 
-How it works: `chat.py` launches `claude -p --input-format stream-json
---output-format stream-json --permission-mode bypassPermissions --mcp-config
-<agentic_android>`. The MCP server (`agentic_android/mcp_server.py`) exposes
+### How it works: the MCP device server
+
+The interesting part of the `claude-cli` path is that the agent is just Claude
+Code, with your phone handed to it as tools over
+[MCP](https://modelcontextprotocol.io) (the Model Context Protocol). You reuse
+Claude Code's whole agent loop — planning, tool use, recovery — pointed at a phone,
+running on your existing Claude subscription, so there's no `ANTHROPIC_API_KEY` and
+no per-token bill.
+
+When you run `--chat`, `chat.py` does three things:
+
+1. Writes a temporary MCP config that points at `python -m agentic_android.mcp_server`,
+   a small [FastMCP](https://modelcontextprotocol.io) server that talks over stdio.
+   The device serial, adb path, and the reliability settings are passed to it as
+   environment variables.
+2. Spawns the headless agent with that server attached:
+   ```
+   claude -p --input-format stream-json --output-format stream-json \
+     --permission-mode bypassPermissions \
+     --allowedTools ToolSearch,mcp__agentic_android \
+     --mcp-config <tmp.json> --strict-mcp-config \
+     --append-system-prompt "<device rules>" --model sonnet
+   ```
+3. Relays both directions. It prints the agent's stream-json events (its text and
+   each tool call) as they arrive, and feeds whatever you type back in as a user
+   message — so you can steer mid-task without stopping it.
+
+The server (`agentic_android/mcp_server.py`) exposes the device as MCP tools:
 `screenshot`, `tap`, `tap_element`, `swipe`, `type_text`, `press_key`,
-`launch_app`, `list_apps`, and `dump_ui`. Screen-changing tools return a fresh
-screenshot the agent can see.
+`launch_app`, `list_apps`, and `dump_ui`. Every screen-changing tool returns a
+fresh screenshot in its result, so the agent sees the effect of each action (the
+computer-use loop). If a capture comes back blank/black, it returns the UI element
+list instead, so a protected surface can't blind it.
+
+Why this is nice:
+
+- No API key and no token bill — it rides your logged-in Claude Code.
+- You get the whole agent for free. Claude Code already knows how to plan, retry,
+  and chain tools, so the device code stays small: it only has to expose adb.
+- MCP is portable. `agentic_android` is a standard MCP server, so any MCP client
+  (Claude Desktop, another agent) can attach it and drive the phone too — nothing
+  is tied to this CLI.
+- It's genuinely multimodal: the tools hand back real screenshots, not just text.
+- It's isolated and autonomous. It runs in this project's directory (its own
+  Claude Code session history), under `bypassPermissions` so it doesn't prompt on
+  every tap, with `--strict-mcp-config` so only your device server is loaded.
 
 ### Persistence level (0–5) and cost
 
@@ -286,6 +363,7 @@ for the run to `debug/session-<timestamp>.jsonl`, one JSON object per line:
 | `agentic_android/agent.py` | Provider-agnostic agent loop; one-shot `run()` and interactive `chat()`. |
 | `agentic_android/tools.py` | Tool schemas (converted to OpenAI function format by `brains.py`). |
 | `agentic_android/config.py` | Loads `agentic-android.toml` and the persistence-level text. |
+| `agentic_android/doctor.py` | Preflight checks (`--doctor`), device auto-detection, provider reachability. |
 | `agentic_android/__main__.py` | CLI: provider, device, and dispatch. |
 
 The API agent defaults to `claude-opus-4-8`. Coordinates the model returns are in
@@ -298,14 +376,13 @@ taps land correctly even when screenshots are downscaled.
   but works best with plain ASCII. For unusual unicode, use an on-screen keyboard
   or a per-app text method.
 - This automates whatever device you point it at. Review a task before running a
-  destructive one. There is no built-in confirmation gate; add one in
-  `agent._dispatch` if you want human approval in the loop.
+  destructive one, and turn on `confirm_destructive` to be prompted before
+  high-risk actions (uninstall, buy, delete, factory reset, sign out).
 - One action set per step keeps the loop readable. Raise `--max-steps` for longer
   flows.
 
 ## Possible additions
 
-- A confirmation gate for destructive actions (uninstall, factory reset, purchases).
 - `scroll_to_text` / `tap_text` helpers built on `dump_ui` for steadier targeting.
 - Multi-device fan-out; record and replay of a successful action trace.
 

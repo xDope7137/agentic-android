@@ -76,10 +76,11 @@ class AnthropicBrain(Brain):
     label = "anthropic"
 
     def __init__(self, model: str, system: str, api_key: str | None = None,
-                 base_url: str | None = None, max_tokens: int = 8000, recorder=None):
+                 base_url: str | None = None, max_tokens: int = 8000, recorder=None,
+                 api_timeout: float = 120.0, api_retries: int = 2):
         import anthropic
 
-        kwargs: dict = {}
+        kwargs: dict = {"timeout": api_timeout, "max_retries": api_retries}
         if api_key:
             kwargs["api_key"] = api_key
         if base_url:
@@ -149,10 +150,11 @@ class OpenAIBrain(Brain):
     label = "openai"
 
     def __init__(self, model: str, system: str, api_key: str | None = None,
-                 base_url: str | None = None, max_tokens: int = 8000, recorder=None):
+                 base_url: str | None = None, max_tokens: int = 8000, recorder=None,
+                 api_timeout: float = 120.0, api_retries: int = 2):
         from openai import OpenAI
 
-        kwargs: dict = {}
+        kwargs: dict = {"timeout": api_timeout, "max_retries": api_retries}
         if api_key:
             kwargs["api_key"] = api_key
         if base_url:
@@ -245,7 +247,8 @@ class OllamaBrain(Brain):
     label = "ollama"
 
     def __init__(self, model: str, system: str, base_url: str = "http://localhost:11434",
-                 num_ctx: int = 16384, max_tokens: int = 8000, recorder=None):
+                 num_ctx: int = 16384, max_tokens: int = 8000, recorder=None,
+                 api_timeout: float = 600.0):
         import httpx
 
         b = (base_url or "http://localhost:11434").rstrip("/")
@@ -260,7 +263,7 @@ class OllamaBrain(Brain):
         self.tools = to_openai_tools()  # Ollama accepts the OpenAI tools schema
         self.system = system
         self.history: list[dict] = [{"role": "system", "content": system}]
-        self._client = httpx.Client(timeout=600.0)
+        self._client = httpx.Client(timeout=api_timeout)
 
     @staticmethod
     def _user(text: str, image_b64: str | None) -> dict:
@@ -327,15 +330,19 @@ class OllamaBrain(Brain):
 
 def make_brain(provider: str, *, system: str, model: str, api_key: str | None = None,
                base_url: str | None = None, max_tokens: int = 8000, recorder=None,
-               num_ctx: int = 16384) -> Brain:
+               num_ctx: int = 16384, api_timeout: float = 120.0, api_retries: int = 2) -> Brain:
     if provider == "anthropic":
         return AnthropicBrain(model, system, api_key=api_key, base_url=base_url,
-                              max_tokens=max_tokens, recorder=recorder)
+                              max_tokens=max_tokens, recorder=recorder,
+                              api_timeout=api_timeout, api_retries=api_retries)
     if provider == "ollama":
+        # Local inference can be slow; give it a generous floor regardless of the cloud default.
         return OllamaBrain(model, system, base_url=base_url or "http://localhost:11434",
-                           num_ctx=num_ctx, max_tokens=max_tokens, recorder=recorder)
+                           num_ctx=num_ctx, max_tokens=max_tokens, recorder=recorder,
+                           api_timeout=max(api_timeout, 600.0))
     if provider in ("openai", "lmstudio"):  # lmstudio is OpenAI-compatible (and does tool calls)
         return OpenAIBrain(model, system, api_key=api_key, base_url=base_url,
-                           max_tokens=max_tokens, recorder=recorder)
+                           max_tokens=max_tokens, recorder=recorder,
+                           api_timeout=api_timeout, api_retries=api_retries)
     raise ValueError(f"unknown provider {provider!r} "
                      "(use 'anthropic', 'openai', 'ollama', or 'lmstudio')")

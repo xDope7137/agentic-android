@@ -10,7 +10,7 @@ import json
 from .adb import ADBError
 from .brains import Brain
 from .config import persistence_block
-from .device import Device
+from .device import Device, is_destructive
 from .tools import SCREEN_CHANGING
 
 MODEL = "claude-opus-4-8"  # default Anthropic model
@@ -94,13 +94,14 @@ def _compact(d: dict) -> str:
 class AgenticAndroid:
     def __init__(self, brain: Brain, device: Device | None = None,
                  max_steps: int = 40, verbose: bool = True, vision: bool = True,
-                 pricing: dict | None = None):
+                 pricing: dict | None = None, confirm_destructive: bool = False):
         self.brain = brain
         self.device = device or Device()
         self.max_steps = max_steps
         self.verbose = verbose
         self.vision = vision  # False = feed the screen as a text element list
         self.pricing = pricing or {}
+        self.confirm_destructive = confirm_destructive
 
     def _print_cost(self) -> None:
         u = getattr(self.brain, "usage", None)
@@ -114,11 +115,13 @@ class AgenticAndroid:
         self._log(f"[cost] {self.brain.model}: {u['input']:,} in{cached} + {u['output']:,} out  →  {money}")
 
     def _observe(self) -> tuple[str, str | None]:
-        """The current screen as the model perceives it: (text, image_b64|None)."""
-        if self.vision:
-            shot = self.device.screenshot()
-            return f"Screen {shot['width']}x{shot['height']} px.", shot["data"]
-        return self.device.ui_elements(), None
+        """The current screen as the model perceives it: (text, image_b64|None).
+
+        `device.observe` adds the safety net: in vision mode, if the screenshot
+        comes back blank/black, the text becomes the UI element list so the model
+        isn't stranded on a dead image (the image still rides along)."""
+        o = self.device.observe(self.vision)
+        return o["text"], o["image"]
 
     def _log(self, *args) -> None:
         if self.verbose:
@@ -139,14 +142,62 @@ class AgenticAndroid:
             return f"User chose option {raw}: {opts[int(raw) - 1]}"
         return f"User answered: {raw}" if raw else "User gave no answer."
 
+    # -- destructive-action gate -------------------------------------------
+
+    def _confirm(self, action: str, label: str, keyword: str) -> bool:
+        """Ask the operator to approve a high-risk action. Returns True to proceed."""
+        print(f"\n⚠️  About to {action}: \"{label}\"  (matched '{keyword}').")
+        try:
+            ans = input("   Proceed? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("y", "yes")
+
+    def _gate_element(self, target: dict) -> str | None:
+        """Block message if a tap_element target is destructive and the user declines."""
+        if not self.confirm_destructive:
+            return None
+        label = target.get("label") or target.get("id") or ""
+        kw = is_destructive(label, self.device.destructive_keywords)
+        if kw and not self._confirm("tap", label, kw):
+            return (f"Blocked: '{label}' is a destructive action and the user declined. "
+                    "Try a different approach or ask the user what to do instead.")
+        return None
+
+    def _gate_tap(self, x: int, y: int) -> str | None:
+        """Best-effort gate for raw coordinate taps: if the tap lands on a known
+        destructive element, confirm first. No-op when nothing is nearby."""
+        if not self.confirm_destructive:
+            return None
+        els = self.device._last_elements
+        if not els:
+            return None
+        dx, dy = self.device._to_device(x, y)
+        near = min(els, key=lambda e: (e["cx"] - dx) ** 2 + (e["cy"] - dy) ** 2)
+        if (near["cx"] - dx) ** 2 + (near["cy"] - dy) ** 2 > 75 * 75:
+            return None  # not clearly on a listed element
+        label = near.get("label") or ""
+        kw = is_destructive(label, self.device.destructive_keywords)
+        if kw and not self._confirm("tap", label, kw):
+            return (f"Blocked: tapping near '{label}' looks destructive and the user "
+                    "declined. Try a different approach or ask the user.")
+        return None
+
     def _execute(self, name: str, args: dict) -> tuple[str, str | None]:
         """Run one tool. Returns (text, screenshot_b64 | None)."""
         note = ""
         try:
             if name == "tap":
+                blocked = self._gate_tap(args["x"], args["y"])
+                if blocked:
+                    return blocked, None
                 self.device.tap(args["x"], args["y"])
                 note = f"Tapped ({args['x']}, {args['y']})."
             elif name == "tap_element":
+                target = self.device.resolve_element(index=args.get("index"), text=args.get("text"))
+                blocked = self._gate_element(target)
+                if blocked:
+                    return blocked, None
                 el = self.device.tap_element(index=args.get("index"), text=args.get("text"))
                 note = f"Tapped element #{el['index']} {el.get('label') or el.get('id') or ''!r}."
             elif name == "swipe":

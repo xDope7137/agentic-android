@@ -39,6 +39,43 @@ max_long_edge = 1568
 # (one JSONL file per run). Handy for debugging; off by default. Same as --debug.
 debug = true
 
+# ---- Reliable Runs: self-checks & recovery (sensible defaults; rarely need changing) ----
+# If a screenshot comes back blank/black (some app surfaces can't be captured),
+# fall back to reading the screen from the UI element list instead of stalling.
+auto_ui_fallback = true
+# A screenshot smaller than this many PNG bytes is treated as blank/dead. A solid
+# black screen is ~6 KB; a real screen is hundreds of KB. Lower it on very small
+# screens; set 0 to disable blank detection entirely.
+blank_png_bytes = 20000
+# After each action, wait until the screen stops changing (up to settle_timeout)
+# instead of a fixed pause — steadier on slow/animated screens. false = fixed sleep.
+wait_idle = true
+settle = 0.8            # fixed pause seconds, used only when wait_idle = false
+settle_timeout = 4.0    # max seconds to wait for the screen to go idle
+# Retry transient adb failures (a dropped/flaky connection) before giving up.
+adb_retries = 2
+adb_backoff = 0.5       # base backoff seconds (exponential)
+adb_timeout = 60        # per-adb-command timeout (seconds)
+# LLM call timeout/retries (anthropic & openai). Prevents hangs on a stalled API.
+api_timeout = 120.0
+api_retries = 2
+# Pause and ask before HIGH-RISK actions (uninstall, buy/pay, delete, factory
+# reset, sign out, …). Off by default so you aren't surprised; turn on for safety.
+confirm_destructive = false
+# Override the high-risk label list if you like (matched case-insensitively):
+# destructive_keywords = ["uninstall", "delete", "buy", "pay", "factory reset"]
+
+# ---- Onboarding: preflight checks (doctor) ----
+# Run a quick check before each run (adb, device, screenshot, provider) and fail
+# with a clear, fixable message instead of a cryptic error. `--doctor` runs the
+# full report; `--no-preflight` skips this. preflight_screenshot adds the (slower)
+# screenshot check to the auto-preflight.
+preflight = true
+preflight_screenshot = true
+connect_timeout = 10.0   # bound `adb connect host:port`
+# When no serial is set, use the sole attached device automatically (prompt if many).
+auto_select_device = true
+
 
 # ---- provider = "claude-cli" (recommended; no API key) -------------------
 [claude_cli]

@@ -112,6 +112,24 @@ class Config:
     max_long_edge: int = 1568
     debug: bool = False
     debug_dir: str = "debug"
+    # reliability ("Reliable Runs") — all live in [agent]
+    auto_ui_fallback: bool = True      # on a blank/black screenshot, fall back to the UI element list
+    blank_png_bytes: int = 20000       # PNG byte size below which a capture is treated as blank (0 = off)
+    wait_idle: bool = True             # poll until the screen stops changing instead of a fixed sleep
+    settle: float = 0.8                # fixed settle seconds (used when wait_idle = false)
+    settle_timeout: float = 4.0        # max seconds to wait for the screen to go idle
+    adb_retries: int = 2               # retries for transient adb failures
+    adb_backoff: float = 0.5           # base backoff seconds (exponential)
+    adb_timeout: int = 60              # per-adb-command timeout
+    api_timeout: float = 120.0         # per-LLM-call timeout (anthropic/openai)
+    api_retries: int = 2               # LLM retry count (SDK-delegated backoff)
+    confirm_destructive: bool = False  # pause and confirm before high-risk actions
+    destructive_keywords: list | None = None  # override the high-risk label list (None = built-in default)
+    # onboarding (doctor / preflight)
+    preflight: bool = True             # run lightweight checks before a normal run
+    preflight_screenshot: bool = True  # include the (slower) screenshot check in the auto-preflight
+    connect_timeout: float = 10.0      # bound `adb connect host:port`
+    auto_select_device: bool = True    # use the sole attached device when no serial is set
     # claude-cli (chat mode — your logged-in `claude`, no API key)
     claude_model: str = "sonnet"
     claude_budget_usd: float | None = None
@@ -177,6 +195,40 @@ def load_config() -> Config:
         cfg.debug = bool(agent["debug"])
     if agent.get("debug_dir"):
         cfg.debug_dir = str(agent["debug_dir"])
+    # reliability
+    if "auto_ui_fallback" in agent:
+        cfg.auto_ui_fallback = bool(agent["auto_ui_fallback"])
+    if agent.get("blank_png_bytes") is not None:
+        cfg.blank_png_bytes = int(agent["blank_png_bytes"])
+    if "wait_idle" in agent:
+        cfg.wait_idle = bool(agent["wait_idle"])
+    if agent.get("settle") is not None:
+        cfg.settle = float(agent["settle"])
+    if agent.get("settle_timeout") is not None:
+        cfg.settle_timeout = float(agent["settle_timeout"])
+    if agent.get("adb_retries") is not None:
+        cfg.adb_retries = int(agent["adb_retries"])
+    if agent.get("adb_backoff") is not None:
+        cfg.adb_backoff = float(agent["adb_backoff"])
+    if agent.get("adb_timeout") is not None:
+        cfg.adb_timeout = int(agent["adb_timeout"])
+    if agent.get("api_timeout") is not None:
+        cfg.api_timeout = float(agent["api_timeout"])
+    if agent.get("api_retries") is not None:
+        cfg.api_retries = int(agent["api_retries"])
+    if "confirm_destructive" in agent:
+        cfg.confirm_destructive = bool(agent["confirm_destructive"])
+    if agent.get("destructive_keywords"):
+        cfg.destructive_keywords = [str(k) for k in agent["destructive_keywords"]]
+    # onboarding
+    if "preflight" in agent:
+        cfg.preflight = bool(agent["preflight"])
+    if "preflight_screenshot" in agent:
+        cfg.preflight_screenshot = bool(agent["preflight_screenshot"])
+    if agent.get("connect_timeout") is not None:
+        cfg.connect_timeout = float(agent["connect_timeout"])
+    if "auto_select_device" in agent:
+        cfg.auto_select_device = bool(agent["auto_select_device"])
 
     cc = data.get("claude_cli", {})
     if cc.get("model"):
@@ -236,6 +288,8 @@ def _apply_env_overrides(cfg: Config) -> None:
         cfg.provider = env["AGENTIC_ANDROID_PROVIDER"]
     if env.get("ANDROID_SERIAL"):
         cfg.serial = env["ANDROID_SERIAL"]
+    if env.get("AGENTIC_ANDROID_NO_PREFLIGHT"):
+        cfg.preflight = False
     if env.get("OPENAI_API_KEY"):
         cfg.openai_api_key = env["OPENAI_API_KEY"]
     if env.get("OPENAI_BASE_URL"):

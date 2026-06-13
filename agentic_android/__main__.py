@@ -27,7 +27,7 @@ from .agent import AgenticAndroid, build_system_prompt
 from .chat import run_chat
 from .config import PROJECT_ROOT, PROVIDERS, clamp_effort, config_path, load_config
 from .debuglog import SessionRecorder, new_session_path
-from .device import Device
+from .device import DEFAULT_DESTRUCTIVE, Device
 
 OFFICIAL_OPENAI = "https://api.openai.com/v1"
 
@@ -69,11 +69,49 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--debug-dir", help="Directory for debug session files (default: debug/).")
     parser.add_argument("--list-devices", action="store_true", help="List attached devices and exit.")
     parser.add_argument("-q", "--quiet", action="store_true", help="(agent) Suppress step logging.")
+    # reliability ("Reliable Runs")
+    parser.add_argument("--wait-idle", dest="wait_idle", action="store_const", const=True, default=None,
+                        help="Wait for the screen to stop changing after each action (default).")
+    parser.add_argument("--no-wait-idle", dest="wait_idle", action="store_const", const=False,
+                        help="Use a fixed settle delay instead of waiting for the screen to be idle.")
+    parser.add_argument("--settle-timeout", type=float, help="Max seconds to wait for the screen to go idle.")
+    parser.add_argument("--blank-png-bytes", type=int,
+                        help="PNG byte size below which a screenshot counts as blank (0 = disable detection).")
+    parser.add_argument("--no-ui-fallback", dest="auto_ui_fallback", action="store_const", const=False, default=None,
+                        help="Don't fall back to the UI element list when a screenshot is blank/black.")
+    parser.add_argument("--adb-retries", type=int, help="Retries for transient adb failures.")
+    parser.add_argument("--api-timeout", type=float, help="Per-LLM-call timeout in seconds (anthropic/openai).")
+    parser.add_argument("--api-retries", type=int, help="LLM retry count.")
+    parser.add_argument("--confirm-destructive", dest="confirm_destructive", action="store_const", const=True,
+                        default=None, help="Pause for confirmation before destructive actions (uninstall/buy/delete/…).")
+    parser.add_argument("--no-confirm-destructive", dest="confirm_destructive", action="store_const", const=False,
+                        help="Disable the destructive-action confirmation gate.")
+    # onboarding (doctor / preflight)
+    parser.add_argument("--doctor", action="store_true",
+                        help="Run preflight diagnostics (adb, device, screenshot, provider) and exit.")
+    parser.add_argument("--no-preflight", dest="preflight", action="store_const", const=False, default=None,
+                        help="Skip the automatic pre-run checks.")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Non-interactive: never prompt (fail instead of asking, e.g. in scripts/CI).")
     args = parser.parse_args(argv)
 
     provider = args.provider or ("claude-cli" if args.chat else cfg.provider)
     serial = args.serial or cfg.serial
     effort = clamp_effort(args.effort if args.effort is not None else cfg.effort)
+
+    # reliability knobs: CLI flag overrides config (None = "not set on the CLI")
+    def _pick(flag, conf):
+        return flag if flag is not None else conf
+    wait_idle = _pick(args.wait_idle, cfg.wait_idle)
+    auto_ui_fallback = _pick(args.auto_ui_fallback, cfg.auto_ui_fallback)
+    settle_timeout = _pick(args.settle_timeout, cfg.settle_timeout)
+    blank_png_bytes = _pick(args.blank_png_bytes, cfg.blank_png_bytes)
+    adb_retries = _pick(args.adb_retries, cfg.adb_retries)
+    api_timeout = _pick(args.api_timeout, cfg.api_timeout)
+    api_retries = _pick(args.api_retries, cfg.api_retries)
+    confirm_destructive = _pick(args.confirm_destructive, cfg.confirm_destructive)
+    do_preflight = _pick(args.preflight, cfg.preflight)
+    destructive_keywords = cfg.destructive_keywords or list(DEFAULT_DESTRUCTIVE)
 
     debug = args.debug or cfg.debug
     debug_dir = args.debug_dir or cfg.debug_dir
@@ -81,9 +119,16 @@ def main(argv: list[str] | None = None) -> int:
         debug_dir = os.path.join(PROJECT_ROOT, debug_dir)
     debug_path = new_session_path(debug_dir) if debug else None
 
-    adb = ADB(serial=serial)
+    adb = ADB(serial=serial, retries=adb_retries, backoff=cfg.adb_backoff, timeout=cfg.adb_timeout)
     if serial and ":" in serial:
         adb.ensure_connected()
+
+    # --doctor: full diagnostics, then exit (works even if `adb devices` errors)
+    if args.doctor:
+        from .doctor import doctor
+        return doctor(cfg, provider=provider, serial=serial, model=args.model,
+                      base_url=args.base_url, max_long_edge=cfg.max_long_edge,
+                      connect_timeout=cfg.connect_timeout)
 
     try:
         attached = adb.devices()
@@ -95,19 +140,27 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(attached) if attached else "(no devices attached)")
         return 0
 
-    if not attached:
-        print("error: no Android device detected. Boot/connect one (network emulator: "
-              "`adb connect <ip>:<port>`) and check `python -m agentic_android --list-devices`.", file=sys.stderr)
+    from .doctor import preflight as run_preflight, select_device
+    serial, err = select_device(adb, serial, attached, auto_select=cfg.auto_select_device,
+                                interactive=sys.stdin.isatty(), assume_yes=args.yes)
+    if err:
+        print(f"error: {err}", file=sys.stderr)
         return 2
-    if not serial and len(attached) > 1:
-        print("error: multiple devices attached; set [device].serial or pass --serial. Devices:", file=sys.stderr)
-        print("  " + "\n  ".join(attached), file=sys.stderr)
-        return 2
-    serial = serial or attached[0]
 
     where = config_path()
     print(f"provider={provider} · device={serial} · effort={effort}/5"
           + (f" · config={where}" if where else " · (no config file; using defaults)"))
+
+    # auto-preflight: fail fast with actionable messages (runs for ALL providers,
+    # including claude-cli which otherwise wouldn't touch the device until later).
+    if do_preflight:
+        ok, msg = run_preflight(cfg, provider=provider, serial=serial, model=args.model,
+                                base_url=args.base_url, max_long_edge=cfg.max_long_edge,
+                                include_screenshot=cfg.preflight_screenshot,
+                                connect_timeout=cfg.connect_timeout)
+        if not ok:
+            print(msg, file=sys.stderr)
+            return 2
 
     # ---- claude-cli: spawn the claude agent (chat) ----
     if provider == "claude-cli":
@@ -116,6 +169,9 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model or cfg.claude_model,
             budget=args.budget if args.budget is not None else cfg.claude_budget_usd,
             max_long_edge=cfg.max_long_edge, effort=effort, debug_path=debug_path,
+            blank_png_bytes=blank_png_bytes, auto_ui_fallback=auto_ui_fallback,
+            wait_idle=wait_idle, settle_timeout=settle_timeout, adb_retries=adb_retries,
+            confirm_destructive=confirm_destructive, destructive_keywords=destructive_keywords,
         )
 
     # ---- anthropic / openai: API brain ----
@@ -169,7 +225,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.vision is not None:
         vision = args.vision
 
-    device = Device(adb=adb, max_long_edge=cfg.max_long_edge)
+    device = Device(adb=adb, max_long_edge=cfg.max_long_edge, settle=cfg.settle,
+                    blank_png_bytes=blank_png_bytes, auto_ui_fallback=auto_ui_fallback,
+                    wait_idle=wait_idle, settle_timeout=settle_timeout,
+                    destructive_keywords=destructive_keywords)
     recorder = SessionRecorder(debug_path) if debug_path else None
     try:
         from .brains import make_brain
@@ -180,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             provider, system=build_system_prompt(effort, vision), model=model,
             api_key=api_key, base_url=base_url, recorder=recorder,
             num_ctx=cfg.ollama_num_ctx, max_tokens=None if local else 8000,
+            api_timeout=api_timeout, api_retries=api_retries,
         )
     except ImportError as exc:
         pkg = "anthropic" if provider == "anthropic" else "openai"
@@ -191,7 +251,8 @@ def main(argv: list[str] | None = None) -> int:
           + (f" · base_url={base_url}" if base_url else "")
           + (f" · debug={debug_path}" if debug_path else ""))
     agent = AgenticAndroid(brain=brain, device=device, max_steps=args.max_steps,
-                         verbose=not args.quiet, vision=vision, pricing=cfg.pricing)
+                         verbose=not args.quiet, vision=vision, pricing=cfg.pricing,
+                         confirm_destructive=confirm_destructive)
 
     try:
         if args.task:
