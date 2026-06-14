@@ -36,6 +36,11 @@ def _confirm_on() -> bool:
     return _envb("AGENTIC_ANDROID_CONFIRM_DESTRUCTIVE", False)
 
 
+def _forbid_list() -> list[str]:
+    raw = os.environ.get("AGENTIC_ANDROID_FORBID", "")
+    return [x for x in raw.split(",") if x]
+
+
 def _dev() -> Device:
     global _device
     if _device is None:
@@ -122,6 +127,11 @@ def tap_element(index: int | None = None, text: str = "", confirm: bool = False)
         target = dev.resolve_element(index=index, text=text or None)
     except ADBError as e:
         return f"tap_element failed: {e}"
+    label = target.get("label") or target.get("id") or ""
+    hit = next((f for f in _forbid_list() if f.lower() in label.lower()), None)
+    if hit:
+        return (f"GUARDRAIL VIOLATED: tapping '{label}' matches the forbidden rule '{hit}'. "
+                "Do not do this — tell the user and stop.")
     if _confirm_on() and not confirm:
         kw = is_destructive(target.get("label") or target.get("id"), dev.destructive_keywords)
         if kw:

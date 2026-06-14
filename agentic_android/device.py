@@ -169,6 +169,14 @@ class Device:
     def ui_xml(self) -> str:
         return self.adb.ui_dump()
 
+    def foreground_app(self) -> str | None:
+        """Package name of the app currently in the foreground (or None)."""
+        return self.adb.foreground_package()
+
+    def foreground_activity(self) -> str | None:
+        """Full 'pkg/activity' component in the foreground (or None)."""
+        return self.adb.top_activity()
+
     def list_apps(self, name_filter: str | None = None, launchable_only: bool = True,
                   limit: int = 200) -> str:
         """Installed app package names (for use with launch_app), optionally

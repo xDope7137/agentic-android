@@ -334,6 +334,59 @@ python -m agentic_android --provider openai --base-url http://localhost:11434/v1
 Vision is still better when the model supports it. Text mode is the fallback that
 makes non-vision models usable.
 
+### Skills: learn once, run free
+
+Record a task the first time (the LLM does it) and the steps are saved as a
+deterministic, self-healing skill. Replaying it drives the device with no LLM calls;
+if the UI changed, it repairs just the affected step and updates the skill.
+
+```bash
+# record (needs an API provider — the controllable loop)
+python -m agentic_android --provider openai --record "open the Clock app and start a timer" --as timer
+python -m agentic_android --run-skill timer      # replay, ~zero LLM cost
+python -m agentic_android --skills               # list saved skills
+```
+
+Skills live in `data/skills/<name>.json` (git-ignored). On replay the agent first
+tries a mined `am start` shortcut to jump past navigation, then runs each step,
+verifying it against the screen it expected; a step that no longer matches is healed
+with one LLM call and the fix is written back, so the cost is paid once per change,
+not every run. You can also turn a `--chat` session's debug log into a skill with
+`--import-trace debug/session-*.jsonl`. Secrets typed into password/OTP fields are
+never stored — those steps are marked for a live rerun instead.
+
+### Guardrails and self-verifying tasks
+
+Give a task rules it must respect and a success condition to verify. Deterministic
+rules are checked from the UI tree after every step (free); a natural-language
+success/forbidden check is judged by the model at the end (and optionally every N
+steps with `--judge-frequency`).
+
+```bash
+python -m agentic_android --provider openai "open my cart and check the total" \
+  --stay-in-app com.amazon.mShop.android.shopping \
+  --forbid "Buy now" --forbid "Place order" \
+  --assert "the cart total is shown and no order was placed" \
+  --on-violation rewind
+```
+
+On a violation it stops (default), rewinds toward the last good screen and tries
+another path (`--on-violation rewind`), or asks you (`ask`). At the end it prints a
+verdict (which rules held, whether success was verified) and exits non-zero (code 3)
+if a guardrail failed — useful in scripts. Rules can also live in a file:
+`--guardrails task.toml`. On the `claude-cli` path the rules are enforced as a
+device-level block on forbidden taps plus instructions in the agent's prompt; the API
+providers enforce them in the loop.
+
+### A nicer CLI (styled output + inline screenshots)
+
+With `rich` installed (`pip install rich`, or the `ui` / `full` extra) the chat gets a
+status bar, panels, and colored tool calls. In a terminal that supports inline images
+(kitty, iTerm2) it also draws the phone screen after each action; elsewhere it falls
+back to text. Control it with `--ui auto|rich|plain` and `--inline-screen auto|on|off`
+(or the `[ui]` section). Piped or redirected output is always plain with no image
+escapes, so recordings and logs stay clean.
+
 ## Debugging
 
 Add `--debug` (or `[agent] debug = true`) to save every API request and response
@@ -364,6 +417,9 @@ for the run to `debug/session-<timestamp>.jsonl`, one JSON object per line:
 | `agentic_android/tools.py` | Tool schemas (converted to OpenAI function format by `brains.py`). |
 | `agentic_android/config.py` | Loads `agentic-android.toml` and the persistence-level text. |
 | `agentic_android/doctor.py` | Preflight checks (`--doctor`), device auto-detection, provider reachability. |
+| `agentic_android/skills.py` | Record / replay / self-heal skills (learn once, run free). |
+| `agentic_android/guardrails.py` | Forbidden-state + success-assertion checks, verdict, rewind. |
+| `agentic_android/ui.py` | Styled CLI output + inline screenshots (optional `rich`). |
 | `agentic_android/__main__.py` | CLI: provider, device, and dispatch. |
 
 The API agent defaults to `claude-opus-4-8`. Coordinates the model returns are in
@@ -384,7 +440,8 @@ taps land correctly even when screenshots are downscaled.
 ## Possible additions
 
 - `scroll_to_text` / `tap_text` helpers built on `dump_ui` for steadier targeting.
-- Multi-device fan-out; record and replay of a successful action trace.
+- A persistent navigation graph for fast cross-app routing; multi-device fan-out.
+- Trigger/watch mode (act when a notification or screen condition fires).
 
 ## License
 

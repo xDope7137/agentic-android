@@ -2,6 +2,8 @@
 .venv/
 .venv-win/
 debug/
+data/
+memory/
 __pycache__/
 *.pyc
 *.egg-info/

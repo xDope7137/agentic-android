@@ -28,6 +28,7 @@ from .chat import run_chat
 from .config import PROJECT_ROOT, PROVIDERS, clamp_effort, config_path, load_config
 from .debuglog import SessionRecorder, new_session_path
 from .device import DEFAULT_DESTRUCTIVE, Device
+from .ui import make_renderer
 
 OFFICIAL_OPENAI = "https://api.openai.com/v1"
 
@@ -93,6 +94,38 @@ def main(argv: list[str] | None = None) -> int:
                         help="Skip the automatic pre-run checks.")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Non-interactive: never prompt (fail instead of asking, e.g. in scripts/CI).")
+    # interactive CLI presentation
+    parser.add_argument("--ui", choices=["auto", "rich", "plain"],
+                        help="CLI style (default auto: rich if installed and a TTY).")
+    parser.add_argument("--inline-screen", dest="inline_screen", choices=["auto", "on", "off"], default=None,
+                        help="Show the phone screen inline after each action (kitty/iTerm2).")
+    parser.add_argument("--no-inline-screen", dest="inline_screen", action="store_const", const="off",
+                        help="Disable inline screenshots.")
+    parser.add_argument("--screen-max-cells", type=int, help="Inline screenshot width in terminal cells.")
+    # skills (learn once, run free)
+    parser.add_argument("--record", metavar="TASK",
+                        help="Run TASK with the API agent, then save it as a replayable skill.")
+    parser.add_argument("--as", dest="skill_name", metavar="NAME",
+                        help="Name for the recorded / imported skill.")
+    parser.add_argument("--run-skill", dest="run_skill", metavar="NAME",
+                        help="Replay a saved skill deterministically (heals drifted steps with the LLM).")
+    parser.add_argument("--skills", action="store_true", help="List saved skills and exit.")
+    parser.add_argument("--import-trace", dest="import_trace", metavar="JSONL",
+                        help="Build a skill from a claude-cli debug JSONL trace.")
+    # guardrails & verify
+    parser.add_argument("--forbid", action="append", metavar="TEXT",
+                        help="Forbidden on-screen label/text (repeatable); a violation stops/rewinds.")
+    parser.add_argument("--forbid-nl", dest="forbid_nl", action="append", metavar="DESC",
+                        help="Forbidden state in plain English, checked by an LLM judge (repeatable).")
+    parser.add_argument("--assert", dest="assert_success", metavar="DESC",
+                        help="Plain-English success condition, verified at the end.")
+    parser.add_argument("--stay-in-app", dest="stay_in_app", metavar="PKG",
+                        help="The foreground app must not change (package name).")
+    parser.add_argument("--guardrails", metavar="FILE", help="Load guardrails from a TOML/JSON file.")
+    parser.add_argument("--on-violation", choices=["stop", "rewind", "ask"],
+                        help="What to do on a guardrail violation (default stop).")
+    parser.add_argument("--judge-frequency", dest="judge_frequency", type=int, metavar="N",
+                        help="Run the NL judge every N steps (0 = only at the end).")
     args = parser.parse_args(argv)
 
     provider = args.provider or ("claude-cli" if args.chat else cfg.provider)
@@ -112,6 +145,33 @@ def main(argv: list[str] | None = None) -> int:
     confirm_destructive = _pick(args.confirm_destructive, cfg.confirm_destructive)
     do_preflight = _pick(args.preflight, cfg.preflight)
     destructive_keywords = cfg.destructive_keywords or list(DEFAULT_DESTRUCTIVE)
+    ui_mode = args.ui or cfg.ui
+    inline_screen = args.inline_screen or cfg.inline_screen
+    screen_max_cells = args.screen_max_cells or cfg.screen_max_cells
+
+    # skill listing / import need no device
+    if args.skills:
+        from .skills import list_skills
+        sks = list_skills()
+        if not sks:
+            print('(no saved skills yet — record one with --record "<task>" --as <name>)')
+        for s in sks:
+            sc = " · shortcut" if (s.shortcut and s.shortcut.component) else ""
+            print(f"{s.slug:24} {len(s.steps):>2} steps{sc}  —  {s.task}")
+        return 0
+    if args.import_trace:
+        from .skills import SkillImporter
+        sk = SkillImporter.from_jsonl(args.import_trace, name=args.skill_name)
+        print(f"imported {len(sk.steps)} steps → {sk.save()}")
+        return 0
+
+    # build the guardrail set (file < CLI), shared by both paths
+    from .guardrails import from_cli as _gr_cli, from_file as _gr_file, merge as _gr_merge
+    gset = _gr_merge(_gr_file(args.guardrails) if args.guardrails else None, _gr_cli(args))
+    if args.on_violation:
+        gset.on_violation = args.on_violation
+    if args.judge_frequency is not None:
+        gset.judge_frequency = args.judge_frequency
 
     debug = args.debug or cfg.debug
     debug_dir = args.debug_dir or cfg.debug_dir
@@ -164,6 +224,23 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- claude-cli: spawn the claude agent (chat) ----
     if provider == "claude-cli":
+        if args.record:
+            print("error: --record needs an API provider (the claude-cli chat loop isn't "
+                  "recordable). Try --provider openai|anthropic|ollama|lmstudio.", file=sys.stderr)
+            return 2
+        if args.run_skill:  # deterministic replay only (no API key → no healing)
+            from .skills import SkillRunner, find_skill
+            sk = find_skill(args.run_skill)
+            if not sk:
+                print(f"error: no skill named {args.run_skill!r} (see --skills).", file=sys.stderr)
+                return 2
+            device = Device(adb=adb, max_long_edge=cfg.max_long_edge, settle=cfg.settle,
+                            blank_png_bytes=blank_png_bytes, auto_ui_fallback=auto_ui_fallback,
+                            wait_idle=wait_idle, settle_timeout=settle_timeout,
+                            destructive_keywords=destructive_keywords)
+            print(SkillRunner(device, sk, brain_factory=None, heal=False,
+                              use_shortcut=cfg.skill_shortcut).run())
+            return 0
         return run_chat(
             serial=serial, adb_path=adb.adb_path,
             model=args.model or cfg.claude_model,
@@ -172,6 +249,9 @@ def main(argv: list[str] | None = None) -> int:
             blank_png_bytes=blank_png_bytes, auto_ui_fallback=auto_ui_fallback,
             wait_idle=wait_idle, settle_timeout=settle_timeout, adb_retries=adb_retries,
             confirm_destructive=confirm_destructive, destructive_keywords=destructive_keywords,
+            ui_mode=ui_mode, inline_screen=inline_screen, screen_max_cells=screen_max_cells,
+            guardrails=gset if not gset.is_empty() else None,
+            max_output_tokens=cfg.claude_max_output_tokens,
         )
 
     # ---- anthropic / openai: API brain ----
@@ -250,9 +330,55 @@ def main(argv: list[str] | None = None) -> int:
     print(f"model={model} · screen={'image' if vision else 'text'}"
           + (f" · base_url={base_url}" if base_url else "")
           + (f" · debug={debug_path}" if debug_path else ""))
+    renderer = make_renderer(ui_mode=ui_mode, inline_screen=inline_screen,
+                             screen_max_cells=screen_max_cells,
+                             status_fields={"provider": provider, "model": model,
+                                            "device": serial, "effort": f"{effort}/5"})
+    def _judge_factory(system_prompt):  # cheap LLM judge for NL guardrails (same provider)
+        return make_brain(provider, system=system_prompt, model=model, api_key=api_key,
+                          base_url=base_url, num_ctx=cfg.ollama_num_ctx,
+                          max_tokens=None if local else 1024,
+                          api_timeout=api_timeout, api_retries=api_retries)
     agent = AgenticAndroid(brain=brain, device=device, max_steps=args.max_steps,
                          verbose=not args.quiet, vision=vision, pricing=cfg.pricing,
-                         confirm_destructive=confirm_destructive)
+                         confirm_destructive=confirm_destructive, ui=renderer,
+                         guardrails=gset if not gset.is_empty() else None,
+                         judge_factory=_judge_factory)
+
+    # ---- skills: replay or record (API path; healing uses this provider's brain) ----
+    if args.run_skill:
+        from .skills import SkillRunner, find_skill
+        sk = find_skill(args.run_skill)
+        if not sk:
+            print(f"error: no skill named {args.run_skill!r} (see --skills).", file=sys.stderr)
+            return 2
+
+        def _factory(system_prompt):
+            return make_brain(provider, system=system_prompt, model=model, api_key=api_key,
+                              base_url=base_url, num_ctx=cfg.ollama_num_ctx,
+                              max_tokens=None if local else 8000,
+                              api_timeout=api_timeout, api_retries=api_retries)
+        runner = SkillRunner(device, sk, brain_factory=(_factory if cfg.skill_heal else None),
+                             heal=cfg.skill_heal, use_shortcut=cfg.skill_shortcut)
+        print(runner.run())
+        return 0
+    if args.record:
+        from datetime import datetime
+        from .skills import SkillRecorder
+        agent.recorder = SkillRecorder(device)
+        print(f"\n=== Recording: {args.record} ===")
+        result = agent.run(args.record)
+        print(f"\n--- Result: {result}\n")
+        rec = agent.recorder
+        if rec.success and rec.steps:
+            name = args.skill_name or args.record
+            sk = rec.finalize(name=name, task=args.record,
+                              created_at=datetime.now().isoformat(timespec="seconds"))
+            print(f"saved skill '{sk.name}' ({len(sk.steps)} steps) → {sk.save()}")
+        else:
+            print("not saved (run didn't end with done(success=true), or recorded no steps).")
+        agent._print_cost()
+        return 0
 
     try:
         if args.task:
@@ -266,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"error from {provider} ({model}): {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    if agent.verdict is not None:
+        print("\n" + agent.verdict.report())
+        return agent.verdict.exit_code()
     return 0
 
 

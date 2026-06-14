@@ -76,11 +76,26 @@ connect_timeout = 10.0   # bound `adb connect host:port`
 # When no serial is set, use the sole attached device automatically (prompt if many).
 auto_select_device = true
 
+# ---- Skills: learn once, run free ----
+# Record a task once, then replay it deterministically (~zero LLM cost):
+#   python -m agentic_android --provider openai --record "open the clock app" --as clock
+#   python -m agentic_android --run-skill clock        # replays with no LLM calls
+skill_heal = true       # heal a drifted step with the LLM on replay (needs an API provider)
+skill_shortcut = true   # try a mined `am start` shortcut to skip navigation on replay
+
+
+# ---- Interactive CLI presentation ----
+[ui]
+mode = "auto"           # auto (rich if installed + a TTY) | rich | plain
+inline_screen = "auto"  # auto | on | off — show the phone screen inline (kitty/iTerm2) each action
+screen_max_cells = 40   # inline screenshot width in terminal cells
+
 
 # ---- provider = "claude-cli" (recommended; no API key) -------------------
 [claude_cli]
-model = "sonnet"      # sonnet | haiku | opus
-budget_usd = 0        # 0 = no spend cap
+model = "claude-opus-4-8"   # most capable; or an alias: opus | sonnet | haiku
+budget_usd = 0              # 0 = no spend cap
+max_output_tokens = 32000   # high response cap for the chat (also raises MCP-output cap)
 
 
 # ---- provider = "anthropic" ---------------------------------------------

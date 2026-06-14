@@ -11,6 +11,7 @@ ANTHROPIC_API_KEY is needed.
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from .config import persistence_block
 
@@ -61,6 +63,20 @@ ask first. The user may send new messages while you work — treat them as \
 steering and adjust immediately.\
 """
 
+# Always appended — tells the agent how to use its persistent personal memory.
+_MEMORY_BLOCK = """\
+Personal memory — a folder at {dir} persists across sessions and is private to this \
+user. You're allowed the Read/Write/Edit/Glob file tools; use them to make it useful:
+- At the START of a session, list and read any files there (Glob {dir}/*) to recall what \
+you already know about this user: their preferences, the people/names they mention, their \
+apps and accounts, routines, and how they like things done. Use it silently — don't \
+recite it unless relevant.
+- When you learn something DURABLE and useful during a task (e.g. "default browser is \
+Firefox", "usual order is a flat white", a friend they message often), save or update a \
+short markdown note there — one topic per file (preferences.md, contacts.md, …). Keep \
+notes concise and factual. NEVER store secrets (passwords, OTP/2FA codes, card numbers).
+- Only ever write inside that memory folder; never modify the program's own files."""
+
 # Added to the system prompt only when confirm_destructive is on.
 _CONFIRM_PROTOCOL = (
     "Destructive-action guard: before any irreversible or committing action "
@@ -76,7 +92,8 @@ def _mcp_config(serial: str, adb_path: str, max_long_edge: int, *,
                 blank_png_bytes: int = 20000, auto_ui_fallback: bool = True,
                 wait_idle: bool = True, settle_timeout: float = 4.0,
                 adb_retries: int = 2, confirm_destructive: bool = False,
-                destructive_keywords: list | None = None) -> str:
+                destructive_keywords: list | None = None,
+                forbid: list | None = None, stay_in_app: str | None = None) -> str:
     env = {
         "ANDROID_SERIAL": serial or "",
         "AGENTIC_ANDROID_ADB": adb_path,
@@ -91,6 +108,10 @@ def _mcp_config(serial: str, adb_path: str, max_long_edge: int, *,
     }
     if destructive_keywords:
         env["AGENTIC_ANDROID_DESTRUCTIVE_KEYWORDS"] = ",".join(destructive_keywords)
+    if forbid:
+        env["AGENTIC_ANDROID_FORBID"] = ",".join(forbid)
+    if stay_in_app:
+        env["AGENTIC_ANDROID_STAY_IN_APP"] = stay_in_app
     cfg = {
         "mcpServers": {
             "agentic_android": {
@@ -111,8 +132,11 @@ def _compact(d: dict) -> str:
     return s if len(s) <= 80 else s[:77] + "…"
 
 
-def _reader(proc: subprocess.Popen, debug_path: str | None = None) -> None:
-    """Parse the agent's stream-json stdout and print it readably."""
+def _reader(proc: subprocess.Popen, renderer, turn_active=None,
+            debug_path: str | None = None) -> None:
+    """Parse the agent's stream-json stdout and render it (styled + inline screens).
+    `turn_active` (a threading.Event) is cleared on each turn result so the input
+    loop knows when a turn is in flight (and must interrupt to steer it)."""
     for line in proc.stdout:
         line = line.strip()
         if not line:
@@ -127,22 +151,42 @@ def _reader(proc: subprocess.Popen, debug_path: str | None = None) -> None:
         t = ev.get("type")
         if t == "system" and ev.get("subtype") == "init":
             sid = str(ev.get("session_id", ""))[:8]
-            print(f"\n[agent ready · session {sid} · model {ev.get('model', '?')}]")
-            print("Type a task (e.g. 'Install WhatsApp on my phone'). "
-                  "You can keep typing to steer it mid-task. Ctrl-C or 'exit' to quit.\n")
+            renderer.status(model=ev.get("model", "?"))
+            renderer.banner(f"\n[agent ready · session {sid} · model {ev.get('model', '?')}]")
+            renderer.banner("Type a task (e.g. 'Install WhatsApp on my phone'). "
+                            "You can keep typing to steer it mid-task. Ctrl-C or 'exit' to quit.\n")
         elif t == "assistant":
             for b in ev.get("message", {}).get("content", []):
                 if b.get("type") == "text" and b.get("text", "").strip():
-                    print(f"\nagent> {b['text'].strip()}")
+                    renderer.agent_text(b["text"].strip())
                 elif b.get("type") == "tool_use":
                     name = b.get("name", "").split("__")[-1]
-                    print(f"   · {name} {_compact(b.get('input', {}))}")
+                    renderer.tool_start(name, b.get("input", {}))
+        elif t == "user":
+            content = ev.get("message", {}).get("content", [])
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":  # replayed user message (your typed steer)
+                    txt = (b.get("text") or "").strip()
+                    if txt.startswith("[Request interrupted"):
+                        renderer.info("  (interrupted the previous step)")
+                    elif txt:
+                        renderer.user_msg(txt)
+                elif b.get("type") == "tool_result":  # render any resulting screenshot inline
+                    rc = b.get("content", [])
+                    for blk in rc if isinstance(rc, list) else []:
+                        if isinstance(blk, dict) and blk.get("type") == "image":
+                            src = blk.get("source", {})
+                            if src.get("type") == "base64" and src.get("data"):
+                                renderer.screen(src["data"],
+                                                media_type=src.get("media_type", "image/png"))
         elif t == "result":
-            cost = ev.get("total_cost_usd")
-            tail = f" · ${cost:.3f}" if isinstance(cost, (int, float)) else ""
-            print(f"[turn complete · {ev.get('subtype', 'ok')}{tail}]\n")
+            if turn_active is not None:
+                turn_active.clear()
+            renderer.result(ev.get("subtype", "ok"), ev.get("total_cost_usd"))
     # stdout closed → agent exited
-    print("\n[agent process ended]")
+    renderer.banner("\n[agent process ended]")
 
 
 def _stderr(proc: subprocess.Popen) -> None:
@@ -151,12 +195,16 @@ def _stderr(proc: subprocess.Popen) -> None:
             print(f"[claude] {line.rstrip()}", file=sys.stderr)
 
 
-def run_chat(serial: str, adb_path: str, model: str = "sonnet",
+def run_chat(serial: str, adb_path: str, model: str = "claude-opus-4-8",
              budget: float | None = None, max_long_edge: int = 1568,
              effort: int = 3, debug_path: str | None = None, *,
              blank_png_bytes: int = 20000, auto_ui_fallback: bool = True,
              wait_idle: bool = True, settle_timeout: float = 4.0, adb_retries: int = 2,
-             confirm_destructive: bool = False, destructive_keywords: list | None = None) -> int:
+             confirm_destructive: bool = False, destructive_keywords: list | None = None,
+             ui_mode: str = "auto", inline_screen: str = "auto", screen_max_cells: int = 40,
+             guardrails=None, max_output_tokens: int = 32000) -> int:
+    from .ui import make_renderer
+
     try:  # flush each line as it's printed (so piped/redirected output stays live)
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -167,22 +215,38 @@ def run_chat(serial: str, adb_path: str, model: str = "sonnet",
               "(`claude` once, interactively).", file=sys.stderr)
         return 2
 
+    renderer = make_renderer(ui_mode=ui_mode, inline_screen=inline_screen,
+                             screen_max_cells=screen_max_cells,
+                             status_fields={"provider": "claude-cli", "model": model,
+                                            "device": serial, "effort": f"{effort}/5"})
+
+    # Persistent, per-user memory folder (private; git-ignored). Lives under the
+    # install dir so it sits beside the project the agent is spawned in.
+    memory_dir = os.path.join(PROJECT_ROOT, "memory", getpass.getuser())
+    os.makedirs(memory_dir, exist_ok=True)
+
     system_prompt = APPEND_SYSTEM_PROMPT + "\n\nPersistence & asking:\n" + persistence_block(effort, "chat")
+    system_prompt += "\n\n" + _MEMORY_BLOCK.format(dir=memory_dir)
     if confirm_destructive:
         system_prompt += "\n\n" + _CONFIRM_PROTOCOL
+    if guardrails is not None and not guardrails.is_empty():
+        system_prompt += "\n\n" + guardrails.system_prompt_block()
 
     mcp_cfg = _mcp_config(serial, adb_path, max_long_edge,
                           blank_png_bytes=blank_png_bytes, auto_ui_fallback=auto_ui_fallback,
                           wait_idle=wait_idle, settle_timeout=settle_timeout,
                           adb_retries=adb_retries, confirm_destructive=confirm_destructive,
-                          destructive_keywords=destructive_keywords)
+                          destructive_keywords=destructive_keywords,
+                          forbid=(guardrails.forbid if guardrails else None),
+                          stay_in_app=(guardrails.stay_in_app if guardrails else None))
     args = [
         claude, "-p",
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
         "--permission-mode", "bypassPermissions",
-        "--allowedTools", "ToolSearch,mcp__agentic_android",
+        "--allowedTools", "ToolSearch,Read,Write,Edit,Glob,mcp__agentic_android",
+        "--replay-user-messages",   # echo typed messages back so steering is visible
         "--mcp-config", mcp_cfg,
         "--strict-mcp-config",
         "--append-system-prompt", system_prompt,
@@ -191,19 +255,31 @@ def run_chat(serial: str, adb_path: str, model: str = "sonnet",
     if budget:
         args += ["--max-budget-usd", str(budget)]
 
-    print(f"Spawning agent: claude {model} · device {serial} · effort {effort}/5 · "
-          f"cwd {PROJECT_ROOT} · {'$%.2f budget' % budget if budget else 'no budget cap'}")
+    renderer.banner(f"Spawning agent: claude {model} · device {serial} · effort {effort}/5 · "
+                    f"cwd {PROJECT_ROOT} · {'$%.2f budget' % budget if budget else 'no budget cap'}")
+    # Give the chat room: a high response cap, and a high MCP-output cap so big
+    # screenshots/element lists (a screenshot is tens of thousands of tokens) aren't
+    # truncated by Claude Code's default per-tool-result limit.
+    child_env = {
+        **os.environ,
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_output_tokens),
+        "MAX_MCP_OUTPUT_TOKENS": str(max(max_output_tokens, 100000)),
+    }
     proc = subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, start_new_session=True, cwd=PROJECT_ROOT,
+        text=True, bufsize=1, start_new_session=True, cwd=PROJECT_ROOT, env=child_env,
     )
 
+    renderer.info(f"[memory] {memory_dir}")
     if debug_path:
-        print(f"[debug] saving session to {debug_path}")
-    threading.Thread(target=_reader, args=(proc, debug_path), daemon=True).start()
+        renderer.info(f"[debug] saving session to {debug_path}")
+    turn_active = threading.Event()  # set while a turn is running; cleared on result
+    threading.Thread(target=_reader, args=(proc, renderer, turn_active, debug_path),
+                     daemon=True).start()
     threading.Thread(target=_stderr, args=(proc,), daemon=True).start()
 
     rc = 0
+    req_n = 0
     try:
         while proc.poll() is None:
             try:
@@ -214,15 +290,24 @@ def run_chat(serial: str, adb_path: str, model: str = "sonnet",
                 break
             if not line.strip():
                 continue
-            frame = json.dumps({
-                "type": "user",
-                "message": {"role": "user", "content": [{"type": "text", "text": line}]},
-            })
             try:
-                proc.stdin.write(frame + "\n")
+                # If a turn is already running, interrupt it so this message takes
+                # effect NOW (otherwise it would just queue until the turn ends).
+                if turn_active.is_set():
+                    req_n += 1
+                    proc.stdin.write(json.dumps({
+                        "type": "control_request", "request_id": f"req_{req_n}",
+                        "request": {"subtype": "interrupt"}}) + "\n")
+                    proc.stdin.flush()
+                    time.sleep(0.3)  # let the interrupt land before the new message
+                proc.stdin.write(json.dumps({
+                    "type": "user",
+                    "message": {"role": "user", "content": [{"type": "text", "text": line}]},
+                }) + "\n")
                 proc.stdin.flush()
+                turn_active.set()
             except (BrokenPipeError, ValueError):
-                print("[agent stdin closed]", file=sys.stderr)
+                renderer.error("[agent stdin closed]")
                 break
     except KeyboardInterrupt:
         print("\n[exiting]")

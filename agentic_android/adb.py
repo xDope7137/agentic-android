@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -30,6 +31,10 @@ _TRANSIENT = (
 
 # Characters that `input text` / the shell would otherwise interpret.
 _TEXT_ESCAPE = "()<>|;&*\\~\"'`$ "
+
+# A valid 'package/activity' component, used to gate `am start -n` (the am path
+# bypasses the input-text escaping below, so validate before shelling).
+_COMPONENT_RE = re.compile(r"^[\w.]+/[\w.$]+$")
 
 
 def resolve_adb_path() -> str:
@@ -202,3 +207,39 @@ class ADB:
         except ADBError:
             return []
         return sorted(set(re.findall(r"packageName=(\S+)", out)))
+
+    # -- activities / intents (used by skills + guardrails) -----------------
+
+    def top_activity(self) -> str | None:
+        """The resumed component 'pkg/activity' (the screen in front), or None."""
+        try:
+            out = self.shell("dumpsys activity activities")
+        except ADBError:
+            return None
+        m = re.search(
+            r"(?:topResumedActivity|mResumedActivity|ResumedActivity)\b.*?(\S+/\S+)", out)
+        if not m:
+            return None
+        comp = m.group(1).rstrip("}").strip()
+        return comp if "/" in comp else None
+
+    def foreground_package(self) -> str | None:
+        """Package name of the foreground app, or None."""
+        comp = self.top_activity()
+        return comp.split("/", 1)[0] if comp else None
+
+    def start_activity(self, component: str) -> str:
+        """Launch a specific component 'pkg/activity' via `am start -n` (a learned
+        shortcut, or a checkpoint relaunch). Component is validated first."""
+        if not _COMPONENT_RE.match(component or ""):
+            raise ADBError(f"refusing to start unsafe component {component!r}")
+        return self.shell(f"am start -n {component}")
+
+    def start_action(self, action: str, data: str | None = None) -> str:
+        """Fire an intent by action (+ optional data URI / deeplink) via `am start -a`."""
+        if not re.match(r"^[\w.]+$", action or ""):
+            raise ADBError(f"refusing unsafe action {action!r}")
+        cmd = f"am start -a {action}"
+        if data:
+            cmd += f" -d {shlex.quote(data)}"
+        return self.shell(cmd)

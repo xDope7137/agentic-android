@@ -12,7 +12,8 @@ dependencies = ["adbutils>=2.0", "mcp>=1.0", "defusedxml>=0.7"]
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.69"]                 # provider = "anthropic"
 openai = ["openai>=1.40"]                       # provider = "openai"
-full = ["anthropic>=0.69", "openai>=1.40", "Pillow>=10.0", "python-dotenv>=1.0"]
+ui = ["rich>=13"]                               # styled interactive CLI (optional)
+full = ["anthropic>=0.69", "openai>=1.40", "Pillow>=10.0", "python-dotenv>=1.0", "rich>=13"]
 
 [project.scripts]
 agentic-android = "agentic_android.__main__:main"

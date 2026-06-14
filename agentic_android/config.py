@@ -130,9 +130,17 @@ class Config:
     preflight_screenshot: bool = True  # include the (slower) screenshot check in the auto-preflight
     connect_timeout: float = 10.0      # bound `adb connect host:port`
     auto_select_device: bool = True    # use the sole attached device when no serial is set
+    # interactive CLI presentation ([ui] section)
+    ui: str = "auto"                   # auto | rich | plain
+    inline_screen: str = "auto"        # auto | on | off — show the phone screen inline
+    screen_max_cells: int = 40         # inline screenshot width in terminal cells
+    # skills (record / replay)
+    skill_heal: bool = True            # allow LLM healing when a replayed step drifts
+    skill_shortcut: bool = True        # try the mined am-start shortcut on replay
     # claude-cli (chat mode — your logged-in `claude`, no API key)
-    claude_model: str = "sonnet"
+    claude_model: str = "claude-opus-4-8"      # default chat model (most capable)
     claude_budget_usd: float | None = None
+    claude_max_output_tokens: int = 32000      # max output tokens for the chat (high)
     # anthropic API
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-4-8"
@@ -229,12 +237,26 @@ def load_config() -> Config:
         cfg.connect_timeout = float(agent["connect_timeout"])
     if "auto_select_device" in agent:
         cfg.auto_select_device = bool(agent["auto_select_device"])
+    if "skill_heal" in agent:
+        cfg.skill_heal = bool(agent["skill_heal"])
+    if "skill_shortcut" in agent:
+        cfg.skill_shortcut = bool(agent["skill_shortcut"])
+
+    uiconf = data.get("ui", {})
+    if uiconf.get("mode") in ("auto", "rich", "plain"):
+        cfg.ui = uiconf["mode"]
+    if uiconf.get("inline_screen") in ("auto", "on", "off"):
+        cfg.inline_screen = uiconf["inline_screen"]
+    if uiconf.get("screen_max_cells") is not None:
+        cfg.screen_max_cells = int(uiconf["screen_max_cells"])
 
     cc = data.get("claude_cli", {})
     if cc.get("model"):
         cfg.claude_model = str(cc["model"])
     if cc.get("budget_usd"):
         cfg.claude_budget_usd = float(cc["budget_usd"])
+    if cc.get("max_output_tokens") is not None:
+        cfg.claude_max_output_tokens = int(cc["max_output_tokens"])
 
     an = data.get("anthropic", {})
     if an.get("api_key"):

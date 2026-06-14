@@ -11,7 +11,9 @@ from .adb import ADBError
 from .brains import Brain
 from .config import persistence_block
 from .device import Device, is_destructive
+from .guardrails import GuardrailMonitor
 from .tools import SCREEN_CHANGING
+from .ui import Renderer, make_renderer
 
 MODEL = "claude-opus-4-8"  # default Anthropic model
 
@@ -94,7 +96,8 @@ def _compact(d: dict) -> str:
 class AgenticAndroid:
     def __init__(self, brain: Brain, device: Device | None = None,
                  max_steps: int = 40, verbose: bool = True, vision: bool = True,
-                 pricing: dict | None = None, confirm_destructive: bool = False):
+                 pricing: dict | None = None, confirm_destructive: bool = False,
+                 ui: Renderer | None = None, guardrails=None, judge_factory=None):
         self.brain = brain
         self.device = device or Device()
         self.max_steps = max_steps
@@ -102,6 +105,12 @@ class AgenticAndroid:
         self.vision = vision  # False = feed the screen as a text element list
         self.pricing = pricing or {}
         self.confirm_destructive = confirm_destructive
+        self.ui = ui or make_renderer()
+        self.recorder = None  # a skills.SkillRecorder when recording a skill
+        self.monitor = (GuardrailMonitor(guardrails, self.device, judge_factory=judge_factory,
+                                         confirm=self._confirm)
+                        if guardrails is not None and not guardrails.is_empty() else None)
+        self.verdict = None   # set to a guardrails.Verdict when guardrails are active
 
     def _print_cost(self) -> None:
         u = getattr(self.brain, "usage", None)
@@ -112,7 +121,9 @@ class AgenticAndroid:
         c = estimate_cost(self.brain.model, u["input"], u["output"], u["cached"], self.pricing)
         money = f"${c:.4f}" if c is not None else f"(no price set for {self.brain.model})"
         cached = f", {u['cached']:,} cached" if u["cached"] else ""
-        self._log(f"[cost] {self.brain.model}: {u['input']:,} in{cached} + {u['output']:,} out  →  {money}")
+        if self.verbose:
+            self.ui.cost(f"[cost] {self.brain.model}: {u['input']:,} in{cached} "
+                         f"+ {u['output']:,} out  →  {money}")
 
     def _observe(self) -> tuple[str, str | None]:
         """The current screen as the model perceives it: (text, image_b64|None).
@@ -130,28 +141,13 @@ class AgenticAndroid:
     # -- tool execution -----------------------------------------------------
 
     def _ask_user(self, question: str, options: list | None) -> str:
-        print(f"\n❓ {question}")
-        opts = options or []
-        for i, opt in enumerate(opts, 1):
-            print(f"   {i}) {opt}")
-        try:
-            raw = input("   your answer> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return "User did not answer."
-        if raw.isdigit() and opts and 1 <= int(raw) <= len(opts):
-            return f"User chose option {raw}: {opts[int(raw) - 1]}"
-        return f"User answered: {raw}" if raw else "User gave no answer."
+        return self.ui.ask(question, options)
 
     # -- destructive-action gate -------------------------------------------
 
     def _confirm(self, action: str, label: str, keyword: str) -> bool:
         """Ask the operator to approve a high-risk action. Returns True to proceed."""
-        print(f"\n⚠️  About to {action}: \"{label}\"  (matched '{keyword}').")
-        try:
-            ans = input("   Proceed? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return False
-        return ans in ("y", "yes")
+        return self.ui.confirm(action, label, keyword)
 
     def _gate_element(self, target: dict) -> str | None:
         """Block message if a tap_element target is destructive and the user declines."""
@@ -240,21 +236,47 @@ class AgenticAndroid:
             res = self.brain.step()
             if res.text:
                 last_text = res.text
-                self._log(f"\nagent> {res.text}")
+                if self.recorder:
+                    self.recorder.note_intent(res.text)
+                if self.verbose:
+                    self.ui.agent_text(res.text)
             if not res.tool_calls:
                 return last_text
 
             results = []
             finished = None
+            stop_guardrail = False
             for c in res.tool_calls:
                 if c.name == "done":
                     finished = c.args.get("summary", "") or last_text
+                    if self.recorder:
+                        self.recorder.on_done(c.args)
+                    if self.monitor and self.verdict is None:
+                        self.verdict = self.monitor.at_done()
                     results.append((c.id, "Acknowledged.", None))
                     continue
-                self._log(f"   · {c.name} {_compact(c.args)}")
+                handle = self.ui.tool_start(c.name, c.args) if self.verbose else None
+                if self.recorder:
+                    self.recorder.before(c.name, c.args)
                 text, image = self._execute(c.name, c.args)
+                ok = not text.startswith(("ADB error", "Blocked"))
+                if self.recorder:
+                    self.recorder.after(c.name, c.args, ok=ok)
+                if self.monitor and c.name in SCREEN_CHANGING:
+                    stop, note = self.monitor.after_step()
+                    if note:
+                        text = f"{text}\n{note}"
+                    stop_guardrail = stop_guardrail or stop
+                if self.verbose:
+                    self.ui.tool_end(handle, ok=ok)
+                    if image and c.name in SCREEN_CHANGING:
+                        self.ui.screen(image)  # inline phone screenshot (if supported)
                 results.append((c.id, text, image))
             self.brain.add_tool_results(results)
+            if stop_guardrail:
+                if self.monitor and self.verdict is None:
+                    self.verdict = self.monitor.at_done()
+                return last_text or "Stopped: a guardrail was violated."
             if finished is not None:
                 return finished
         return last_text or "Stopped: reached the maximum number of steps."
@@ -270,12 +292,14 @@ class AgenticAndroid:
     def chat(self) -> None:
         """Interactive: one ongoing conversation; each of your messages is sent
         with a fresh screenshot, the agent acts, then control returns to you."""
-        print(f"\n[chat ready · brain {self.brain.label}]")
-        print("Type a task (e.g. 'Install WhatsApp on my phone'). Ctrl-D or 'exit' to quit.\n")
+        self.ui.status(brain=self.brain.label, model=getattr(self.brain, "model", ""),
+                       vision="image" if self.vision else "text")
+        self.ui.banner(f"\n[chat ready · brain {self.brain.label}]")
+        self.ui.banner("Type a task (e.g. 'Install WhatsApp on my phone'). Ctrl-D or 'exit' to quit.\n")
         first = True
         while True:
             try:
-                line = input("you> ")
+                line = self.ui.prompt("you> ")
             except EOFError:
                 break
             if line.strip().lower() in {"exit", "quit", ":q"}:
@@ -292,7 +316,7 @@ class AgenticAndroid:
             try:
                 self._run_turn()
             except KeyboardInterrupt:
-                print("\n[interrupted — back to you]")
+                self.ui.info("\n[interrupted — back to you]")
             except Exception as exc:  # keep the chat alive on API/network errors
-                print(f"\n[error from {self.brain.label}: {type(exc).__name__}: {exc}]")
+                self.ui.error(f"\n[error from {self.brain.label}: {type(exc).__name__}: {exc}]")
             self._print_cost()
