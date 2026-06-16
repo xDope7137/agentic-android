@@ -1,4 +1,5 @@
 .env
+agentic-android.toml
 .venv/
 .venv-win/
 debug/

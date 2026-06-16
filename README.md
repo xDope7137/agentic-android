@@ -110,6 +110,13 @@ sends full-resolution screenshots and still works.
 
 ## Configuration
 
+Copy the template to create your own config (it holds your API keys and device
+serial, so it is git-ignored and never committed):
+
+```bash
+cp agentic-android.toml.example agentic-android.toml
+```
+
 Everything you'd tweak lives in `agentic-android.toml`, which is commented. The
 three settings that matter most:
 

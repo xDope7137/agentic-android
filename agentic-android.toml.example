@@ -21,7 +21,7 @@ provider = "claude-cli"
 [device]
 # Your device's adb id. Run `python -m agentic_android --list-devices` to find it.
 # A networked emulator looks like "192.168.1.79:5555".
-serial = "192.168.1.79:5555"
+serial = ""                       # e.g. "192.168.1.79:5555" or a USB serial (see --list-devices)
 
 
 [agent]
@@ -82,6 +82,20 @@ auto_select_device = true
 #   python -m agentic_android --run-skill clock        # replays with no LLM calls
 skill_heal = true       # heal a drifted step with the LLM on replay (needs an API provider)
 skill_shortcut = true   # try a mined `am start` shortcut to skip navigation on replay
+
+
+# ---- Notification triggers: wake the agent on a phone notification ----
+# Ask for a REACTIVE task in chat (e.g. "reply to WhatsApp messages from my boss"
+# or "when my food delivery arrives, mark it received") and the agent offers to set
+# up a trigger that binds that app's notifications to the task. While a chat session
+# is open, a watcher polls notifications and feeds matching ones to the live agent.
+#   python -m agentic_android --triggers      # list saved triggers
+#   python -m agentic_android --no-triggers   # don't run the watcher this session
+[triggers]
+enabled = true          # run the inline notification watcher during chat
+poll_interval_s = 8.0   # how often to check the phone for new notifications
+# dir = "data/triggers" # where trigger definitions are stored (relative to project root)
+cooldown_s = 15.0       # after firing, briefly ignore the burst the task may cause
 
 
 # ---- Interactive CLI presentation ----
