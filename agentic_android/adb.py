@@ -7,7 +7,6 @@ default device is used.
 
 from __future__ import annotations
 
-import glob
 import os
 import re
 import shlex
@@ -50,15 +49,83 @@ def resolve_adb_path() -> str:
         import adbutils
 
         binaries = os.path.join(os.path.dirname(adbutils.__file__), "binaries")
-        cands = sorted(glob.glob(os.path.join(binaries, "adb*")))
-        for c in cands:  # prefer the non-.exe binary on POSIX
-            if not c.endswith(".exe"):
-                return c
-        if cands:
-            return cands[0]
+        # Match the adb binary by exact name per-platform: adb.exe on Windows,
+        # the extension-less binary on POSIX. A loose `adb*` glob also matches
+        # the bundled AdbWinApi*.dll helpers, which aren't runnable (WinError 193).
+        name = "adb.exe" if os.name == "nt" else "adb"
+        cand = os.path.join(binaries, name)
+        if os.path.isfile(cand):
+            return cand
     except Exception:
         pass
     return "adb"
+
+
+# Markers that begin the trailer sections of `dumpsys notification` (config,
+# history, listeners). We only parse the live records before these, so dismissed
+# / archived notifications aren't mistaken for active ones.
+_NOTIF_TRAILER = re.compile(
+    r"\n\s*(?:mZenLog|mArchive|Notification groups|NotificationRankingHelper|"
+    r"mEnabledNotificationListeners|mAssistants|Ranking Config|mNotificationsByKey)\b")
+_NOTIF_PKG_RE = re.compile(r"\bpkg=(\S+)")
+_NOTIF_KEY_RE = re.compile(r"\bkey=(\S+)")
+_NOTIF_WHEN_RE = re.compile(r"\bwhen=(\d+)")
+
+
+def _notif_value(raw: str) -> str:
+    """Clean an `android.*` extras value across the various dumpsys formats:
+    `Boss`, `String (5) "Boss"`, `Boss (String)`."""
+    v = raw.strip()
+    v = re.sub(r'^String \(\d+\)\s*', "", v)   # `String (5) "Boss"` -> `"Boss"`
+    v = re.sub(r'\s*\((?:String|CharSequence|SpannableString)\)$', "", v)  # trailing type tag
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1]
+    return v.strip()
+
+
+def _notif_extra(block: str, *keys: str) -> str:
+    """First non-empty value among the given `android.<key>` extras in a block."""
+    for k in keys:
+        m = re.search(rf"\bandroid\.{re.escape(k)}=(.*)", block)
+        if m:
+            val = _notif_value(m.group(1))
+            if val and val.lower() != "null":
+                return val
+    return ""
+
+
+def _parse_notifications(out: str) -> list[dict]:
+    """Parse `dumpsys notification` text into a list of active-notification dicts.
+    Tolerant of version differences; unknown/missing fields become ''/None."""
+    if not out or "NotificationRecord(" not in out:
+        return []
+    trailer = _NOTIF_TRAILER.search(out)
+    if trailer:
+        out = out[: trailer.start()]
+    # Split into per-record blocks; chunk[0] is the preamble before the first record.
+    chunks = out.split("NotificationRecord(")
+    seen: set[str] = set()
+    records: list[dict] = []
+    for chunk in chunks[1:]:
+        pkg_m = _NOTIF_PKG_RE.search(chunk)
+        key_m = _NOTIF_KEY_RE.search(chunk)
+        if not pkg_m:
+            continue
+        key = key_m.group(1).rstrip(")") if key_m else ""
+        dedupe = key or f"{pkg_m.group(1)}#{len(records)}"
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        when_m = _NOTIF_WHEN_RE.search(chunk)
+        records.append({
+            "key": key,
+            "package": pkg_m.group(1),
+            "title": _notif_extra(chunk, "title"),
+            "text": _notif_extra(chunk, "text"),
+            "big_text": _notif_extra(chunk, "bigText", "subText") or None,
+            "when": int(when_m.group(1)) if when_m else None,
+        })
+    return records
 
 
 class ADB:
@@ -243,3 +310,31 @@ class ADB:
         if data:
             cmd += f" -d {shlex.quote(data)}"
         return self.shell(cmd)
+
+    # -- notifications (used by the trigger watcher) ------------------------
+
+    def notifications(self) -> list[dict]:
+        """Currently-posted notifications, parsed from `dumpsys notification`.
+
+        Returns a list of dicts:
+            {"key": str, "package": str, "title": str, "text": str,
+             "big_text": str | None, "when": int | None}
+
+        The dumpsys output format is Android-version-specific, so parsing is
+        deliberately defensive: any failure (unknown format, missing fields)
+        degrades to [] / empty fields rather than raising, so a polling watcher
+        never crashes on a quirky device."""
+        out = ""
+        for cmd in ("dumpsys notification --noredact", "dumpsys notification"):
+            # `--noredact` keeps android.title/text from being shown as REDACTED on
+            # secure notifications; it's unsupported on older Android, so fall back.
+            try:
+                out = self.shell(cmd, timeout=20)
+            except ADBError:
+                out = ""
+            if "NotificationRecord(" in out:
+                break
+        try:
+            return _parse_notifications(out)
+        except Exception:
+            return []

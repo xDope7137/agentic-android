@@ -112,6 +112,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skills", action="store_true", help="List saved skills and exit.")
     parser.add_argument("--import-trace", dest="import_trace", metavar="JSONL",
                         help="Build a skill from a claude-cli debug JSONL trace.")
+    # notification triggers (wake-on-notification, chat mode)
+    parser.add_argument("--triggers", action="store_true",
+                        help="List saved notification triggers and exit.")
+    parser.add_argument("--triggers-on", dest="triggers_enabled", action="store_const",
+                        const=True, default=None, help="Enable the inline notification watcher in chat.")
+    parser.add_argument("--no-triggers", dest="triggers_enabled", action="store_const",
+                        const=False, help="Disable the inline notification watcher in chat.")
+    parser.add_argument("--poll-interval", dest="poll_interval", type=float, metavar="SECONDS",
+                        help="How often to poll device notifications for triggers (default 8).")
     # guardrails & verify
     parser.add_argument("--forbid", action="append", metavar="TEXT",
                         help="Forbidden on-screen label/text (repeatable); a violation stops/rewinds.")
@@ -148,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     ui_mode = args.ui or cfg.ui
     inline_screen = args.inline_screen or cfg.inline_screen
     screen_max_cells = args.screen_max_cells or cfg.screen_max_cells
+    triggers_enabled = _pick(args.triggers_enabled, cfg.triggers_enabled)
+    triggers_poll_interval_s = _pick(args.poll_interval, cfg.triggers_poll_interval_s)
 
     # skill listing / import need no device
     if args.skills:
@@ -163,6 +174,17 @@ def main(argv: list[str] | None = None) -> int:
         from .skills import SkillImporter
         sk = SkillImporter.from_jsonl(args.import_trace, name=args.skill_name)
         print(f"imported {len(sk.steps)} steps → {sk.save()}")
+        return 0
+    if args.triggers:
+        from .triggers import list_triggers
+        trigs = list_triggers()
+        if not trigs:
+            print("(no notification triggers yet - the agent creates these in chat when "
+                  "you ask for a reactive task)")
+        for t in trigs:
+            filt = t.title_contains or t.text_contains or t.pattern
+            where = t.package + (f" [{filt}]" if filt else "")
+            print(f"{t.slug:20} {'on ' if t.enabled else 'off'}  {where:32}  ->  {t.task}")
         return 0
 
     # build the guardrail set (file < CLI), shared by both paths
@@ -252,6 +274,9 @@ def main(argv: list[str] | None = None) -> int:
             ui_mode=ui_mode, inline_screen=inline_screen, screen_max_cells=screen_max_cells,
             guardrails=gset if not gset.is_empty() else None,
             max_output_tokens=cfg.claude_max_output_tokens,
+            triggers_enabled=triggers_enabled,
+            triggers_poll_interval_s=triggers_poll_interval_s,
+            triggers_cooldown_s=cfg.triggers_cooldown_s,
         )
 
     # ---- anthropic / openai: API brain ----

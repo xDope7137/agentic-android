@@ -208,6 +208,60 @@ def dump_ui() -> str:
     return xml[:40000] + "\n…[truncated]" if len(xml) > 40000 else xml
 
 
+@mcp.tool()
+def create_trigger(name: str, task: str, package: str, title_contains: str = "",
+                   text_contains: str = "", pattern: str = "",
+                   enabled: bool = False) -> str:
+    """Register a notification trigger: when a notification from `package` arrives
+    (optionally narrowed by `title_contains` / `text_contains` substrings or a
+    `pattern` regex), the agent is woken and asked to perform `task`.
+
+    Use this for recurring, reactive requests ("when X notification arrives, do Y").
+    Resolve the real `package` with list_apps first. Set enabled=True ONLY after the
+    user has explicitly confirmed they want it automated; otherwise it's saved
+    disabled (a draft). Triggers fire while a chat session is open."""
+    from datetime import datetime
+
+    from .triggers import Trigger, slugify
+
+    if not name.strip() or not task.strip() or not package.strip():
+        return "create_trigger needs a non-empty name, task and package."
+    t = Trigger(
+        name=name.strip(), slug=slugify(name), task=task.strip(), package=package.strip(),
+        title_contains=title_contains.strip(), text_contains=text_contains.strip(),
+        pattern=pattern.strip(), enabled=bool(enabled),
+        created_at=datetime.now().isoformat(timespec="seconds"),
+    )
+    path = t.save()
+    state = "ENABLED (live)" if t.enabled else "saved as disabled (draft)"
+    return (f"Trigger '{t.name}' {state}: notifications from {t.package} "
+            f"-> task {t.task!r}. Stored at {path}.")
+
+
+@mcp.tool()
+def list_triggers() -> str:
+    """List saved notification triggers (name, on/off, source package, task)."""
+    from .triggers import list_triggers as _list
+
+    ts = _list()
+    if not ts:
+        return "(no notification triggers yet)"
+    lines = []
+    for t in ts:
+        filt = t.title_contains or t.text_contains or t.pattern
+        where = f"{t.package}" + (f" [{filt}]" if filt else "")
+        lines.append(f"{t.slug:20} {'on ' if t.enabled else 'off'}  {where}  ->  {t.task}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def delete_trigger(name: str) -> str:
+    """Delete a saved notification trigger by name or slug."""
+    from .triggers import delete_trigger as _del
+
+    return f"Deleted trigger {name!r}." if _del(name) else f"No trigger matching {name!r}."
+
+
 def main() -> None:
     mcp.run()
 

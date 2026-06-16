@@ -137,6 +137,11 @@ class Config:
     # skills (record / replay)
     skill_heal: bool = True            # allow LLM healing when a replayed step drifts
     skill_shortcut: bool = True        # try the mined am-start shortcut on replay
+    # notification triggers (wake the agent when the phone gets a notification)
+    triggers_enabled: bool = True      # run the inline notification watcher during chat
+    triggers_poll_interval_s: float = 8.0   # how often to poll device notifications
+    triggers_dir: str = "data/triggers"     # where trigger JSON lives (vs PROJECT_ROOT unless absolute)
+    triggers_cooldown_s: float = 15.0       # after a fire, suppress the burst it may cause
     # claude-cli (chat mode — your logged-in `claude`, no API key)
     claude_model: str = "claude-opus-4-8"      # default chat model (most capable)
     claude_budget_usd: float | None = None
@@ -249,6 +254,16 @@ def load_config() -> Config:
         cfg.inline_screen = uiconf["inline_screen"]
     if uiconf.get("screen_max_cells") is not None:
         cfg.screen_max_cells = int(uiconf["screen_max_cells"])
+
+    trig = data.get("triggers", {})
+    if "enabled" in trig:
+        cfg.triggers_enabled = bool(trig["enabled"])
+    if trig.get("poll_interval_s") is not None:
+        cfg.triggers_poll_interval_s = float(trig["poll_interval_s"])
+    if trig.get("dir"):
+        cfg.triggers_dir = str(trig["dir"])
+    if trig.get("cooldown_s") is not None:
+        cfg.triggers_cooldown_s = float(trig["cooldown_s"])
 
     cc = data.get("claude_cli", {})
     if cc.get("model"):

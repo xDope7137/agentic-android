@@ -32,7 +32,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APPEND_SYSTEM_PROMPT = """\
 You are Agentic Android, operating a real Android device via MCP tools from the \
 `agentic_android` server: screenshot, tap_element, tap, swipe, type_text, \
-press_key, launch_app, list_apps, dump_ui. If those tools are not already \
+press_key, launch_app, list_apps, dump_ui, create_trigger, list_triggers, \
+delete_trigger. If those tools are not already \
 loaded, use ToolSearch to find them (search "agentic_android"). You have no other \
 way to touch the device — do not use Bash/adb directly.
 
@@ -53,6 +54,21 @@ filter like 'clock') to find the real one; if nothing matches, it isn't installe
 - Play Store package is com.android.vending. To install an app: open Play Store, \
 tap Search, type the name, open the correct result, tap Install, wait for it to finish.
 - press_key BACK to dismiss dialogs; HOME for the launcher.
+
+Notification triggers (wake-on-notification): on the user's FIRST instruction, \
+judge whether it's a recurring, REACTIVE request — i.e. "when a notification \
+about X arrives, do Y" (e.g. "reply to WhatsApp messages from my boss", "when my \
+food delivery arrives mark it received"). A one-off like "open settings" is NOT \
+reactive — ignore all of this for those. If it IS reactive: briefly say you can \
+automate it as a notification trigger, then ask ONE short question to confirm \
+(which app/sender, and that they want it automated). Use list_apps to resolve the \
+real package name. Only after the user says yes, call create_trigger(..., \
+enabled=True), binding that app's notifications (narrow with title_contains / \
+text_contains when there's a specific sender/keyword) to the task; then handle any \
+matching notification that's already on screen. While this chat stays open, a \
+watcher polls notifications and will feed you "[auto-trigger ...]" messages to act \
+on. Use list_triggers to show what's set and delete_trigger to remove one. \
+Save triggers DISABLED (a draft) if the user is unsure.
 
 This is a live chat. Briefly tell the user what you're doing and what you see. \
 Act autonomously on navigation/reading, but DO NOT commit or send anything \
@@ -202,7 +218,9 @@ def run_chat(serial: str, adb_path: str, model: str = "claude-opus-4-8",
              wait_idle: bool = True, settle_timeout: float = 4.0, adb_retries: int = 2,
              confirm_destructive: bool = False, destructive_keywords: list | None = None,
              ui_mode: str = "auto", inline_screen: str = "auto", screen_max_cells: int = 40,
-             guardrails=None, max_output_tokens: int = 32000) -> int:
+             guardrails=None, max_output_tokens: int = 32000,
+             triggers_enabled: bool = True, triggers_poll_interval_s: float = 8.0,
+             triggers_cooldown_s: float = 15.0) -> int:
     from .ui import make_renderer
 
     try:  # flush each line as it's printed (so piped/redirected output stays live)
@@ -267,7 +285,8 @@ def run_chat(serial: str, adb_path: str, model: str = "claude-opus-4-8",
     }
     proc = subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, start_new_session=True, cwd=PROJECT_ROOT, env=child_env,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        start_new_session=True, cwd=PROJECT_ROOT, env=child_env,
     )
 
     renderer.info(f"[memory] {memory_dir}")
@@ -278,8 +297,61 @@ def run_chat(serial: str, adb_path: str, model: str = "claude-opus-4-8",
                      daemon=True).start()
     threading.Thread(target=_stderr, args=(proc,), daemon=True).start()
 
+    # Both the human input loop and the notification watcher send messages to the
+    # agent. Serialize stdin writes (interrupt + message) under one lock so they
+    # can't interleave. Returns False if the agent's stdin is gone.
+    stdin_lock = threading.Lock()
+    req_box = {"n": 0}
+
+    def send_to_agent(text: str) -> bool:
+        with stdin_lock:
+            try:
+                # If a turn is already running, interrupt it so this message takes
+                # effect NOW (otherwise it would just queue until the turn ends).
+                if turn_active.is_set():
+                    req_box["n"] += 1
+                    proc.stdin.write(json.dumps({
+                        "type": "control_request", "request_id": f"req_{req_box['n']}",
+                        "request": {"subtype": "interrupt"}}) + "\n")
+                    proc.stdin.flush()
+                    time.sleep(0.3)  # let the interrupt land before the new message
+                proc.stdin.write(json.dumps({
+                    "type": "user",
+                    "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+                }) + "\n")
+                proc.stdin.flush()
+                turn_active.set()
+                return True
+            except (BrokenPipeError, ValueError):
+                return False
+
+    # Inline notification watcher: when a saved+enabled trigger matches a phone
+    # notification, feed its task to the live agent like a typed steer.
+    watcher = None
+    if triggers_enabled:
+        from .adb import ADB
+        from .triggers import NotificationWatcher, list_triggers
+
+        def _on_fire(trigger, notif):
+            title = notif.get("title") or ""
+            text = notif.get("text") or notif.get("big_text") or ""
+            renderer.info(f"[trigger] '{trigger.name}' fired on {notif.get('package')} "
+                          f"notification — waking agent")
+            send_to_agent(
+                f"[auto-trigger '{trigger.name}'] A notification from "
+                f"{notif.get('package')} arrived — {title}: {text}. "
+                f"Now perform this task: {trigger.task}")
+
+        watcher = NotificationWatcher(
+            ADB(serial=serial, adb_path=adb_path, retries=adb_retries),
+            _on_fire, triggers=None, poll_interval_s=triggers_poll_interval_s,
+            cooldown_s=triggers_cooldown_s, log=renderer.info)
+        watcher.start()
+        n_on = sum(1 for t in list_triggers() if t.enabled)
+        renderer.info(f"[triggers] watching notifications (poll {triggers_poll_interval_s:g}s; "
+                      f"{n_on} enabled)")
+
     rc = 0
-    req_n = 0
     try:
         while proc.poll() is None:
             try:
@@ -290,28 +362,14 @@ def run_chat(serial: str, adb_path: str, model: str = "claude-opus-4-8",
                 break
             if not line.strip():
                 continue
-            try:
-                # If a turn is already running, interrupt it so this message takes
-                # effect NOW (otherwise it would just queue until the turn ends).
-                if turn_active.is_set():
-                    req_n += 1
-                    proc.stdin.write(json.dumps({
-                        "type": "control_request", "request_id": f"req_{req_n}",
-                        "request": {"subtype": "interrupt"}}) + "\n")
-                    proc.stdin.flush()
-                    time.sleep(0.3)  # let the interrupt land before the new message
-                proc.stdin.write(json.dumps({
-                    "type": "user",
-                    "message": {"role": "user", "content": [{"type": "text", "text": line}]},
-                }) + "\n")
-                proc.stdin.flush()
-                turn_active.set()
-            except (BrokenPipeError, ValueError):
+            if not send_to_agent(line):
                 renderer.error("[agent stdin closed]")
                 break
     except KeyboardInterrupt:
         print("\n[exiting]")
     finally:
+        if watcher:
+            watcher.stop()
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
